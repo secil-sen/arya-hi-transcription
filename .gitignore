@@ -1,0 +1,36 @@
+# JetBrains / PyCharm
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Poetry venv
+.venv/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tests / coverage
+.tox/
+.nox/
+.coverage*
+htmlcov/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
