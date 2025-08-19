@@ -1,8 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from app.schemas import TranscribeRequest, TranscribeResponse
-from app.pipeline.pipeline_old import run_transcript_pipeline
+from app.pipeline.pipeline import run_transcript_pipeline
 
 app = FastAPI(title="Arya HI Transcript Extraction API")
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "transcript-api"}
 
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe_video(request:TranscribeRequest):

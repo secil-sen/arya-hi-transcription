@@ -3,11 +3,11 @@ import json
 import json5
 import re
 from typing import List, Dict, Any, Optional
-from app.pipeline.config import GPT_CORRECTION_AND_NAME_EXTRACTION_PROMPT, JSON_SCHEMA, NEW_USER_PROMPT, NEW_SYSTEM_PROMPT
+from app.pipeline.config import JSON_SCHEMA
 from app.core.model_registry import models
 
 # -------- Helpers --------
-def _parse_gpt_json_lenient(content: str) -> Optional[List[Dict[str, Any]]]:
+def _parse_gemini_json_lenient(content: str) -> Optional[List[Dict[str, Any]]]:
     try:
         data = json.loads(content)
     except Exception:
@@ -43,7 +43,7 @@ def _extract_json_block(text: str) -> Optional[str]:
     m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
     return m.group(1) if m else None
 
-def _parse_gpt_json(content: str) -> Optional[List[Dict[str, Any]]]:
+def _parse_gemini_json(content: str) -> Optional[List[Dict[str, Any]]]:
     if not content or not isinstance(content, str):
         return None
 
@@ -99,45 +99,39 @@ async def _process_segment_v3(
     current_text = segment["text"]
     next_text = segments[i + 1]["text"] if i < len(segments) - 1 else ""
 
-    prev_speaker_id = segments[i - 1]["speaker"] if i > 0 else ""
-    current_speaker_id = segment["speaker"]
-    next_speaker_id = segments[i + 1]["speaker"] if i < len(segments) - 1 else ""
+    # Build prompt with context
+    prompt = f"""Context: Previous segment: "{prev_text}"
+Current segment: "{current_text}"
+Next segment: "{next_text}"
 
-    prompt = NEW_USER_PROMPT.format(
-        term_list=json.dumps(term_list, ensure_ascii=False),
-        attendee_list=json.dumps(attendee_list, ensure_ascii=False),
-        attendee_id_map=json.dumps(attendee_id_map, ensure_ascii=False),
-        current_text=current_text,
-        current_speaker_id=current_speaker_id,
-        prev_text=prev_text,
-        prev_speaker_id=prev_speaker_id,
-        next_text=next_text,
-        next_speaker_id=next_speaker_id
-    )
+Attendees: {', '.join(attendee_list)}
+Term list: {', '.join(term_list)}
+
+Please correct the current segment text and infer the speaker. Return the result in the following JSON format:
+{{
+    "text_corrected": "corrected text here",
+    "mentioned_attendees": ["list of mentioned attendees"],
+    "multiple_speakers": false,
+    "inferred_speaker": "speaker name",
+    "inferred_speaker_id": "speaker id from attendee list"
+}}"""
 
     max_retries = 3
-    last_error: Optional[str] = None
+    last_error = None
 
     for attempt in range(max_retries):
         try:
             async with semaphore:
-                response = await models.openai_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": NEW_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0,
-                    response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
-                    # max_tokens=384,  # isterseniz sınırlayın
+                # Use Gemini instead of OpenAI
+                response = await asyncio.to_thread(
+                    models.gemini_model.generate_content,
+                    prompt
                 )
 
-            # Bazı SDK sürümlerinde content boş dönebilir; yine de JSON string bekliyoruz
-            content = ""
-            if getattr(response, "choices", None) and response.choices[0].message:
-                content = response.choices[0].message.content or ""
+            # Extract content from Gemini response
+            content = response.text if hasattr(response, 'text') else str(response)
 
-            parsed_list = _parse_gpt_json_lenient(content)
+            parsed_list = _parse_gemini_json_lenient(content)
 
             if parsed_list is None:
                 # Yalnızca ŞEMA/PARSE hatasında retry
@@ -156,7 +150,7 @@ async def _process_segment_v3(
                 item["start"] = segment.get("start")
                 item["end"] = segment.get("end")
                 item["speaker"] = segment.get("speaker", "")
-                item["source"] = "gpt_split" if len(parsed_list) > 1 else "gpt_single"
+                item["source"] = "gemini_split" if len(parsed_list) > 1 else "gemini_single"
                 inferred_id = item.get("inferred_speaker_id")
                 if inferred_id and inferred_id not in (None, "null"):
                     used_ids.add(inferred_id)
@@ -190,20 +184,20 @@ async def _process_segment_v3(
     return [segment_copy]
 
 
-async def gpt_correct_and_infer_segments_async_v3(
+async def gemini_correct_and_infer_segments_async_v3(
     segments: List[Dict[str, Any]],
     attendee_list: List[str],
     term_list: List[str],
     attendee_id_map: Dict[str, str],
-    model: str = "gpt-4o-mini",
+    model: str = "gemini-1.5-flash",
     concurrency_limit: int = 2,
     enable_json_mode: bool = True,
     debug_dir: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Runs correction + speaker inference asynchronously.
+    Runs correction + speaker inference asynchronously using Google Gemini.
     - Stops speaker inference early if all attendee IDs are already inferred.
-    - Uses JSON mode and object wrapper to ensure parseable output.
+    - Uses structured prompts to ensure parseable output.
     - Writes prompt/raw/exception diagnostics when parsing fails (if debug_dir provided).
     """
     semaphore = asyncio.Semaphore(concurrency_limit)

@@ -9,7 +9,7 @@ from app.pipeline.ffmpeg_utils import convert_mp4_to_wav, split_wav_into_chunks_
 from app.pipeline.diarization import diarize_chunks_with_global_ids_union
 from app.pipeline.transcription import run_whisper_transcription
 from app.pipeline.utils import save_as_json, filter_short_segments
-from app.pipeline.correct_and_infer import gpt_correct_and_infer_segments_async_v3
+from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
 
 # .env dosyasını yükle
@@ -42,18 +42,18 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         # Optional Step: Filter short segments:x
         filtered_segments = filter_short_segments(transcribed_segment)
 
-        # Step 4: Correction and infer with GPT
+        # Step 4: Correction and infer with Gemini
         aattendee_id_map = {
              "u_ufuk": "Ufuk",
              "u_samet": "Samet"
         }
         enriched_segments = asyncio.run(
-            gpt_correct_and_infer_segments_async_v3(segments=filtered_segments,
+            gemini_correct_and_infer_segments_async_v3(segments=filtered_segments,
                                                     attendee_list=attendees,
                                                     term_list=TERM_LIST,
                                                     attendee_id_map=aattendee_id_map,
                                                     enable_json_mode=True,
-                                                    debug_dir="/Users/secilsen/Desktop/ARYA/code/transcript-api/tmp/gpt_debug")
+                                                    debug_dir="/Users/secilsen/Desktop/ARYA/code/transcript-api/tmp/gemini_debug")
         )
         # Step 6: Save output
         save_as_json(enriched_segments, output_json_path)

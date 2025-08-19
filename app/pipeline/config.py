@@ -7,7 +7,7 @@ DEFAULT_OUTPUT_ROOT = "/tmp/transcripts"
 
 DIARIZATION_MODEL_NAME = "pyannote/speaker-diarization"
 DIARIZATION_CHUNK_DIR = ROOT_PATH / "chunks"
-OPEN_AI_MODEL_NAME = "gpt-4"
+GEMINI_MODEL_NAME = "gemini-1.5-flash"
 CHUNK_LENGTH = 240
 CHUNK_OVERLAP = 2.0
 VOTES_PER_SEGMENT = 1

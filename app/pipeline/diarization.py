@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple, Union, Optional
 import numpy as np
 from pyannote.core import Segment
 from app.core.model_registry import models
-from config import CHUNK_LENGTH, CHUNK_OVERLAP
+from app.pipeline.config import CHUNK_LENGTH, CHUNK_OVERLAP
 import torchaudio
 from sklearn.cluster import KMeans
 from collections import defaultdict
