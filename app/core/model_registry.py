@@ -30,6 +30,14 @@ class ModelRegistry:
             # Configure Google Gemini
             genai.configure(api_key=gemini_api_key)
             self._gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            # Set generation config for better JSON output
+            self._gemini_model.generation_config = genai.types.GenerationConfig(
+                temperature=0.1,  # Lower temperature for more consistent output
+                top_p=0.8,
+                top_k=40,
+                max_output_tokens=2048,
+            )
             self._initialized = True
 
     @property
@@ -58,7 +66,10 @@ class ModelRegistry:
     def inference(self):
         if self._inference is None:
             self._ensure_initialized()
-            self._inference = Inference(EMBEDDING_MODEL_NAME, window="whole")
+            hf_token = os.getenv("HUGGINGFACE_TOKEN")
+            self._inference = Inference(EMBEDDING_MODEL_NAME, 
+                                      use_auth_token=hf_token,
+                                      window="whole")
         return self._inference
 
 load_dotenv()

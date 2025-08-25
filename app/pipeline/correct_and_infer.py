@@ -8,34 +8,103 @@ from app.core.model_registry import models
 
 # -------- Helpers --------
 def _parse_gemini_json_lenient(content: str) -> Optional[List[Dict[str, Any]]]:
+    if not content or not isinstance(content, str):
+        return None
+    
+    # Clean the content first
+    cleaned = _clean_content_for_json(content)
+    
+    # Try multiple parsing strategies
+    parsed_data = None
+    
+    # Strategy 1: Direct JSON parsing
     try:
-        data = json.loads(content)
-    except Exception:
+        parsed_data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 2: Try JSON5 if direct parsing failed
+    if parsed_data is None:
+        try:
+            parsed_data = json5.loads(cleaned)
+        except Exception:
+            pass
+    
+    # Strategy 3: Extract JSON block if still failed
+    if parsed_data is None:
+        extracted = _extract_json_block(cleaned)
+        if extracted:
+            try:
+                parsed_data = json.loads(extracted)
+            except json.JSONDecodeError:
+                try:
+                    parsed_data = json5.loads(extracted)
+                except Exception:
+                    pass
+    
+    # Strategy 4: Try to find and parse just the JSON part
+    if parsed_data is None:
+        # Look for content between curly braces
+        import re
+        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        matches = re.findall(json_pattern, cleaned)
+        if matches:
+            for match in matches:
+                try:
+                    parsed_data = json.loads(match)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    
+    # Strategy 5: Try to find the first valid JSON object in the text
+    if parsed_data is None:
+        import re
+        # Look for the first { and last } to extract JSON
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start != -1 and end != -1 and start < end:
+            json_candidate = cleaned[start:end+1]
+            try:
+                parsed_data = json.loads(json_candidate)
+            except json.JSONDecodeError:
+                try:
+                    parsed_data = json5.loads(json_candidate)
+                except Exception:
+                    pass
+    
+    if parsed_data is None:
         return None
 
-    # 1) Doğrudan liste ise
-    if isinstance(data, list):
-        return data
-
-    # 2) Obje ise ve "segments" barındırıyorsa
-    if isinstance(data, dict):
-        if "segments" in data and isinstance(data["segments"], list):
-            return data["segments"]
-        # 3) Obje ama tek segment döndürülmüşse
-        #    (schema object → tek kaydı listeye çevir)
-        expected_keys = {"text_corrected", "mentioned_attendees", "multiple_speakers", "candidate_speakers"}
-        if expected_keys.issubset(set(data.keys())):
-            return [data]
-
+    # Normalize the parsed data
+    if isinstance(parsed_data, list):
+        return parsed_data
+    elif isinstance(parsed_data, dict):
+        # If it's a dict with segments, return segments
+        if "segments" in parsed_data and isinstance(parsed_data["segments"], list):
+            return parsed_data["segments"]
+        # If it's a single segment dict, return as list
+        elif any(key in parsed_data for key in ["text_corrected", "inferred_speaker"]):
+            return [parsed_data]
+    
     return None
 
 
 def _clean_content_for_json(text: str) -> str:
     # Strip code fences like ```json ... ``` or ``` ... ```
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL|re.IGNORECASE)
-    if fence:
-        return fence.group(1).strip()
-    return text.strip()
+    import re
+    
+    # Remove markdown code blocks
+    text = re.sub(r'```(?:json)?\s*\n?', '', text)
+    text = re.sub(r'\n?```\s*$', '', text)
+    
+    # Remove leading/trailing whitespace
+    text = text.strip()
+    
+    # Remove any remaining markdown formatting
+    text = re.sub(r'^\s*```\s*', '', text)
+    text = re.sub(r'\s*```\s*$', '', text)
+    
+    return text
 
 def _extract_json_block(text: str) -> Optional[str]:
     # Try to find the first JSON array or object in free-form text
@@ -100,21 +169,44 @@ async def _process_segment_v3(
     next_text = segments[i + 1]["text"] if i < len(segments) - 1 else ""
 
     # Build prompt with context
-    prompt = f"""Context: Previous segment: "{prev_text}"
-Current segment: "{current_text}"
-Next segment: "{next_text}"
+    prompt = f"""You are a transcription correction and speaker inference assistant. 
+
+Context: 
+- Previous segment: "{prev_text}"
+- Current segment: "{current_text}"
+- Next segment: "{next_text}"
 
 Attendees: {', '.join(attendee_list)}
 Term list: {', '.join(term_list)}
 
-Please correct the current segment text and infer the speaker. Return the result in the following JSON format:
+Please correct the current segment text and infer the speaker. You MUST return ONLY valid JSON in this exact format:
+
 {{
     "text_corrected": "corrected text here",
     "mentioned_attendees": ["list of mentioned attendees"],
     "multiple_speakers": false,
     "inferred_speaker": "speaker name",
     "inferred_speaker_id": "speaker id from attendee list"
-}}"""
+}}
+
+CRITICAL REQUIREMENTS: 
+- Return ONLY the raw JSON object, no markdown, no code blocks, no explanations
+- Do NOT wrap in ```json or ``` blocks
+- Do NOT add any text before or after the JSON
+- Ensure the JSON is properly formatted and valid
+- If you cannot determine a speaker, use "Unknown" for inferred_speaker and null for inferred_speaker_id
+- mentioned_attendees should be an empty array if no attendees are mentioned
+- Do NOT add ellipsis ("...") between words or sequences, even if they seem short or incomplete
+- Preserve the original text structure without adding punctuation or filler characters
+
+Example of what NOT to do:
+❌ ```json
+❌ {{
+❌ }}
+
+Example of what TO do:
+✅ {{
+✅ }}"""
 
     max_retries = 3
     last_error = None
@@ -130,8 +222,22 @@ Please correct the current segment text and infer the speaker. Return the result
 
             # Extract content from Gemini response
             content = response.text if hasattr(response, 'text') else str(response)
+            
+            # Debug logging
+            print(f"Segment {i} - Raw Gemini response: {content[:200]}...")
+            print(f"Segment {i} - Response type: {type(response)}")
+            print(f"Segment {i} - Has text attr: {hasattr(response, 'text')}")
+            
+            # Safety check for empty or invalid content
+            if not content or content.strip() == "":
+                print(f"Segment {i} - Empty response from Gemini")
+                last_error = "empty_response"
+                await asyncio.sleep((2 ** attempt) + (0.1 * attempt))
+                continue
 
             parsed_list = _parse_gemini_json_lenient(content)
+            
+            print(f"Segment {i} - Parsed result: {parsed_list}")
 
             if parsed_list is None:
                 # Yalnızca ŞEMA/PARSE hatasında retry
@@ -168,19 +274,27 @@ Please correct the current segment text and infer the speaker. Return the result
             await asyncio.sleep((2 ** attempt) + (0.1 * attempt))
 
     # ---------- Tüm denemeler başarısız ----------
+    print(f"Segment {i} - All parsing attempts failed. Using fallback.")
+    
+    # Create a fallback segment with the original text
     segment_copy = {
         "text_corrected": segment.get("text", ""),
         "mentioned_attendees": [],
         "multiple_speakers": False,
-        "inferred_speaker": "None",
+        "inferred_speaker": "Unknown",
         "inferred_speaker_id": None,
         "start": segment.get("start"),
         "end": segment.get("end"),
         "speaker": segment.get("speaker", ""),
-        "source": "error",
+        "source": "fallback_after_parse_failure",
+        "error_detail": last_error or "JSON parsing failed after all retries"
     }
+    
     if debug_dir and last_error:
-        segment_copy["error_detail"] = last_error
+        from pathlib import Path
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+        Path(f"{debug_dir}/segment_{i}_fallback.txt").write_text(f"Fallback used. Error: {last_error}")
+    
     return [segment_copy]
 
 
@@ -200,6 +314,23 @@ async def gemini_correct_and_infer_segments_async_v3(
     - Uses structured prompts to ensure parseable output.
     - Writes prompt/raw/exception diagnostics when parsing fails (if debug_dir provided).
     """
+    
+    # Safety check for empty segments
+    if not segments:
+        print("WARNING: No segments provided to Gemini processing!")
+        return []
+    
+    print(f"Processing {len(segments)} segments with Gemini...")
+    print(f"First segment sample: {segments[0] if segments else 'None'}")
+    
+    # Validate segment structure
+    required_fields = ["text", "start", "end", "speaker"]
+    for i, seg in enumerate(segments):
+        missing_fields = [field for field in required_fields if field not in seg]
+        if missing_fields:
+            print(f"WARNING: Segment {i} missing required fields: {missing_fields}")
+            print(f"Segment data: {seg}")
+    
     semaphore = asyncio.Semaphore(concurrency_limit)
     used_ids: set = set()
     all_ids = set(attendee_id_map.values())
@@ -207,7 +338,10 @@ async def gemini_correct_and_infer_segments_async_v3(
     results: List[Dict[str, Any]] = []
 
     for i, seg in enumerate(segments):
+        print(f"Processing segment {i}/{len(segments)}: {seg.get('text', '')[:50]}...")
+        
         if used_ids == all_ids:
+            print(f"All attendee IDs already inferred, skipping segment {i}")
             seg_out = {
                 "text_corrected": seg.get("text", ""),
                 "mentioned_attendees": [],
@@ -235,6 +369,12 @@ async def gemini_correct_and_infer_segments_async_v3(
             enable_json_mode=enable_json_mode,
             debug_dir=debug_dir,
         )
+        
+        print(f"Segment {i} processed, got {len(parsed)} results")
         results.extend(parsed)
 
+    print(f"Gemini processing complete. Total results: {len(results)}")
+    if results:
+        print(f"Sample result: {results[0]}")
+    
     return results
