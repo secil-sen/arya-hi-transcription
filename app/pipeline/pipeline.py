@@ -1,5 +1,6 @@
 import os
 import shutil
+import requests
 from uuid import uuid4
 import asyncio
 
@@ -12,7 +13,21 @@ from app.pipeline.utils import save_as_json, filter_short_segments
 from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
 
-# .env dosyasını yükle
+
+def _download_if_url(path: str, target_dir: str) -> str:
+    """Eğer path bir http/https URL ise önce indirip local path döndürür."""
+    if path.startswith("http://") or path.startswith("https://"):
+        local_path = os.path.join(target_dir, "input.mp4")
+        print(f"Downloading remote MP4 to {local_path} ...")
+        r = requests.get(path, stream=True)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Download finished: {local_path}")
+        return local_path
+    return path
+
 
 def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
                             attendees: Optional[List[str]] = None) -> dict:
@@ -28,12 +43,12 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
     print(f"- Session ID: {session_id}")
     print(f"- Attendees: {attendees}")
     print(f"- User session dir: {user_session_dir}")
-    
+
     # Safety check for attendees
     if not attendees:
         print("WARNING: No attendees provided, using default")
         attendees = ["Speaker1", "Speaker2"]  # Default attendees
-    
+
     print(f"Using attendees: {attendees}")
 
     try:
@@ -41,13 +56,16 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         chunk_dir = os.path.join(user_session_dir, "chunks")
         output_json_path = os.path.join(user_session_dir, "transcript_V7.json")
 
+        # NEW: Eğer mp4_path URL ise indir
+        mp4_path = _download_if_url(mp4_path, user_session_dir)
+
         # Step 1: Convert and split
         convert_mp4_to_wav(mp4_path, wav_path)
         print(f"Audio converted to WAV: {wav_path}")
-        
+
         split_wav_into_chunks_v2(wav_path, chunk_dir)
         print(f"WAV split into chunks in directory: {chunk_dir}")
-        
+
         # Check chunk files
         chunk_files = [f for f in os.listdir(chunk_dir) if f.endswith('.wav')]
         print(f"Created {len(chunk_files)} chunk files: {chunk_files[:5]}...")  # Show first 5
@@ -70,36 +88,35 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         # Optional Step: Filter short segments
         filtered_segments = filter_short_segments(transcribed_segment)
         print(f"Filtered segments count: {len(filtered_segments)}")
-        
+
         if filtered_segments:
             print(f"First filtered segment: {filtered_segments[0]}")
         else:
             print("WARNING: No segments after filtering!")
 
         # Step 4: Correction and infer with Gemini
-        # Create attendee ID mapping dynamically
-        attendee_id_map = {}
-        for i, attendee in enumerate(attendees):
-            attendee_id_map[f"u_{attendee.lower()}"] = attendee
-        
-        # Create debug directory in the user session directory
-        debug_dir = os.path.join(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE", "false").lower() == "true" else None
-        
+        attendee_id_map = {f"u_{attendee.lower()}": attendee for attendee in attendees}
+
+        debug_dir = os.path.join(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE",
+                                                                                "false").lower() == "true" else None
+
         enriched_segments = asyncio.run(
-            gemini_correct_and_infer_segments_async_v3(segments=filtered_segments,
-                                                    attendee_list=attendees,
-                                                    term_list=TERM_LIST,
-                                                    attendee_id_map=attendee_id_map,
-                                                    enable_json_mode=True,
-                                                    debug_dir=debug_dir)
+            gemini_correct_and_infer_segments_async_v3(
+                segments=filtered_segments,
+                attendee_list=attendees,
+                term_list=TERM_LIST,
+                attendee_id_map=attendee_id_map,
+                enable_json_mode=True,
+                debug_dir=debug_dir
+            )
         )
-        
+
         print(f"Enriched segments count: {len(enriched_segments)}")
         if enriched_segments:
             print(f"First enriched segment: {enriched_segments[0]}")
         else:
             print("WARNING: No segments after Gemini processing!")
-        
+
         # Step 6: Save output
         save_as_json(enriched_segments, output_json_path)
 
@@ -116,8 +133,10 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
     except Exception as e:
         raise RuntimeError(f"Pipeline failed: {e}")
 
+
 if __name__ == '__main__':
-    run_transcript_pipeline("",
-                            "",
-                            user_id="deb",
-                            attendees=["Ufuk", "Samet"])
+    run_transcript_pipeline(
+        "https://api-lia.arya-ai.com/api/public/meetings/1/af8f6828-6f9c-4331-afb4-8a3ae40349de_20250827_081821.mp4",
+        user_id="deb",
+        attendees=["Ufuk", "Samet"]
+    )

@@ -1,9 +1,9 @@
 import whisper
-from pyannote.audio import Pipeline
+from pyannote.pipeline import Pipeline
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from pyannote.audio import Inference
+# from pyannote.audio import Inference  # Commented out - not available in older version
 from app.core.config import (WHISPER_MODEL_NAME,
                              DIARIZATION_MODEL_NAME,
                              EMBEDDING_MODEL_NAME)
@@ -14,7 +14,7 @@ class ModelRegistry:
         self._whisper = None
         self._diarization = None
         self._gemini_model = None
-        self._inference = None
+        # self._inference = None  # Commented out - not available in older version
         self._initialized = False
 
     def _ensure_initialized(self):
@@ -62,15 +62,15 @@ class ModelRegistry:
             self._ensure_initialized()
         return self._gemini_model
 
-    @property
-    def inference(self):
-        if self._inference is None:
-            self._ensure_initialized()
-            hf_token = os.getenv("HUGGINGFACE_TOKEN")
-            self._inference = Inference(EMBEDDING_MODEL_NAME, 
-                                      use_auth_token=hf_token,
-                                      window="whole")
-        return self._inference
+    # @property
+    # def inference(self):
+    #     if self._inference is None:
+    #         self._ensure_initialized()
+    #         hf_token = os.getenv("HUGGINGFACE_TOKEN")
+    #         self._inference = Inference(EMBEDDING_MODEL_NAME, 
+    #                                   use_auth_token=hf_token,
+    #                                   window="whole")
+    #     return self._inference
 
 load_dotenv()
 models = ModelRegistry() # Global singleton instance.
