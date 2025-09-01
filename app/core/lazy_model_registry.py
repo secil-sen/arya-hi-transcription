@@ -1,5 +1,5 @@
 import whisper
-from pyannote.audio import Pipeline
+from pyannote.pipeline import Pipeline
 import os
 
 class LazyModelRegistry:

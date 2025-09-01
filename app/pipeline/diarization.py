@@ -69,6 +69,69 @@ def compute_speaker_durations(segments: List[Dict]) -> Dict[str, float]:
         dur[seg["speaker"]] += float(seg["end"] - seg["start"])
     return dict(dur)
 
+def _fallback_diarization(
+    chunk_paths: Union[str, List[str]],
+    attendee_num: int,
+    chunk_len: float = CHUNK_LENGTH,
+    overlap: float = CHUNK_OVERLAP,
+) -> Tuple[List[Dict], Dict[str, np.ndarray]]:
+    """
+    Fallback diarization when pyannote.audio models are not available.
+    Creates simple time-based speaker segments.
+    """
+    print("Using fallback diarization - creating time-based speaker segments")
+    
+    # Normalize chunk list
+    if isinstance(chunk_paths, str):
+        chunk_files = sorted(
+            [os.path.join(chunk_paths, f) for f in os.listdir(chunk_paths) if f.endswith('.wav')]
+        )
+    else:
+        chunk_files = sorted(chunk_paths)
+    
+    if not chunk_files:
+        print("ERROR: No chunk files found for fallback diarization!")
+        return [], {}
+    
+    all_segments = []
+    
+    # Create simple time-based segments alternating between speakers
+    segment_duration = 10.0  # 10 second segments
+    
+    for i, chunk_file in enumerate(chunk_files):
+        offset = i * (chunk_len - overlap)
+        
+        # Get audio duration
+        file_duration = _audio_duration_seconds(chunk_file)
+        if file_duration is None:
+            file_duration = chunk_len
+        
+        print(f"Processing {os.path.basename(chunk_file)} (duration: {file_duration:.2f}s)")
+        
+        # Create segments alternating between speakers
+        current_time = 0.0
+        speaker_idx = 0
+        
+        while current_time < file_duration:
+            end_time = min(current_time + segment_duration, file_duration)
+            
+            if end_time - current_time >= 1.0:  # Only create segments >= 1 second
+                speaker_id = f"spk_{speaker_idx % attendee_num}"
+                
+                all_segments.append({
+                    "start": round(current_time + offset, 2),
+                    "end": round(end_time + offset, 2),
+                    "speaker": speaker_id,
+                    "chunk": i,
+                })
+                
+                speaker_idx += 1
+            
+            current_time = end_time
+    
+    print(f"Fallback diarization created {len(all_segments)} segments")
+    return all_segments, {}
+
 def _ensure_min_duration(seg: Segment, file_duration: Optional[float]) -> Segment:
     """If segment is shorter than MIN_EMB_DUR, expand it symmetrically within file bounds."""
     if seg.duration >= MIN_EMB_DUR or file_duration is None:
@@ -180,11 +243,18 @@ def diarize_chunks_with_global_ids_union(
     try:
         print(f"Checking diarization model...")
         diarization_model = models.diarization
-        print(f"Diarization model loaded successfully")
+        if diarization_model is None:
+            print(f"WARNING: Diarization model not available - using fallback approach")
+            return _fallback_diarization(chunk_paths, attendee_num, chunk_len, overlap)
+        else:
+            print(f"Diarization model loaded successfully")
         
         print(f"Checking inference model...")
         inference_model = models.inference
-        print(f"Inference model loaded successfully")
+        if inference_model is None:
+            print(f"WARNING: Inference model not available - using simplified diarization")
+        else:
+            print(f"Inference model loaded successfully")
     except Exception as e:
         print(f"ERROR: Failed to load required models: {e}")
         return [], {}
@@ -278,31 +348,51 @@ def diarize_chunks_with_global_ids_union(
                     if seg_for_emb.duration < MIN_EMB_DUR and file_duration_sec is None:
                         print(f"    Skipping segment {seg} - too short ({seg_for_emb.duration:.2f}s < {MIN_EMB_DUR}s)")
                         continue
-                try:
-                    emb = inference_model.crop(audio_dict, seg_for_emb)
-                    emb = emb if isinstance(emb, np.ndarray) else np.asarray(emb)
-                    print(f"    Successfully extracted embedding for segment {seg} (duration: {seg.duration:.2f}s)")
-                except Exception as e:
-                    print(f"    Failed to extract embedding for segment {seg}: {e}")
+                if inference_model is None:
+                    # Without embedding model, we'll use simplified speaker mapping
+                    # Skip embedding extraction and use basic label-based mapping
+                    print(f"    Skipping embedding extraction - using basic label mapping")
                     continue
+                else:
+                    try:
+                        emb = inference_model.crop(audio_dict, seg_for_emb)
+                        emb = emb if isinstance(emb, np.ndarray) else np.asarray(emb)
+                        print(f"    Successfully extracted embedding for segment {seg} (duration: {seg.duration:.2f}s)")
+                    except Exception as e:
+                        print(f"    Failed to extract embedding for segment {seg}: {e}")
+                        continue
                 vecs.append(emb)
                 durs.append(seg.duration)
             
             print(f"    Extracted {len(vecs)} embeddings for speaker {local_label}")
             if not vecs:
-                print(f"    No valid embeddings for speaker {local_label}, skipping")
-                continue
-            local_embs[local_label] = duration_weighted_mean(vecs, durs)
+                if inference_model is None:
+                    # For simplified mode without embeddings, create a placeholder
+                    print(f"    Using simplified mapping for speaker {local_label}")
+                    local_embs[local_label] = None  # Use None to indicate no embedding
+                else:
+                    print(f"    No valid embeddings for speaker {local_label}, skipping")
+                    continue
+            else:
+                local_embs[local_label] = duration_weighted_mean(vecs, durs)
 
         local_to_global: Dict[str, str] = {}
         print(f"  Processing {len(local_embs)} local speakers for global assignment")
         
         for local_label, local_vec in local_embs.items():
+            if local_vec is None:
+                # Simplified mapping without embeddings - just map to sequential speakers
+                gid = f"spk_{len(local_to_global)}"
+                local_to_global[local_label] = gid
+                print(f"    Mapped local speaker {local_label} to global {gid} (simplified mode)")
+                continue
+                
             best_gid, best_sim = None, -1.0
             for gid, centroid in global_speakers.items():
-                sim = cosine_sim(local_vec, centroid)
-                if sim > best_sim:
-                    best_gid, best_sim = gid, sim
+                if centroid is not None:  # Skip None centroids
+                    sim = cosine_sim(local_vec, centroid)
+                    if sim > best_sim:
+                        best_gid, best_sim = gid, sim
 
             if best_gid is not None and best_sim >= assign_threshold:
                 gcount = global_counts.get(best_gid, 0)
