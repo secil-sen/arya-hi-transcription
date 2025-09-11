@@ -1,6 +1,7 @@
 import os
 import shutil
 import requests
+import json
 from uuid import uuid4
 import asyncio
 
@@ -12,6 +13,12 @@ from app.pipeline.transcription import run_whisper_transcription
 from app.pipeline.utils import save_as_json, filter_short_segments
 from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
+try:
+    from app.pipeline.notification import notify_chunking, save_as_jsonl
+    NOTIFICATION_AVAILABLE = True
+except ImportError:
+    NOTIFICATION_AVAILABLE = False
+    print("Warning: httpx not available, notification functionality disabled")
 
 
 def _download_if_url(path: str, target_dir: str) -> str:
@@ -30,7 +37,7 @@ def _download_if_url(path: str, target_dir: str) -> str:
 
 
 def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
-                            attendees: Optional[List[str]] = None) -> dict:
+                            attendees: Optional[List[str]] = None, meeting_id: Optional[str] = None) -> dict:
     session_id = uuid4().hex
     user_session_dir = os.path.join(output_root, user_id, session_id)
     os.makedirs(user_session_dir, exist_ok=True)
@@ -41,6 +48,7 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
     print(f"- Output root: {output_root}")
     print(f"- User ID: {user_id}")
     print(f"- Session ID: {session_id}")
+    print(f"- Meeting ID: {meeting_id}")
     print(f"- Attendees: {attendees}")
     print(f"- User session dir: {user_session_dir}")
 
@@ -117,10 +125,39 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         else:
             print("WARNING: No segments after Gemini processing!")
 
-        # Step 6: Save output
+        # Step 6: Save output as JSONL (if notification available)
+        output_jsonl_path = os.path.join(user_session_dir, "transcript.jsonl")
+        if NOTIFICATION_AVAILABLE:
+            save_as_jsonl(enriched_segments, output_jsonl_path)
+        else:
+            # Fallback: save as JSONL manually
+            with open(output_jsonl_path, "w", encoding="utf-8") as f:
+                for item in enriched_segments:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        
+        # Also save as JSON for backward compatibility
         save_as_json(enriched_segments, output_json_path)
 
-        # 7. Clean up (if not debug)
+        # Step 7: Send notification to chunking service
+        notification_result = None
+        if meeting_id and NOTIFICATION_AVAILABLE:
+            try:
+                chunking_url = os.getenv("CHUNKING_SERVICE_URL", "http://localhost:8090")
+                notification_result = notify_chunking(
+                    meeting_id=meeting_id,
+                    transcript_path=output_jsonl_path,
+                    chunking_url=chunking_url
+                )
+                print(f"Notification sent successfully: {notification_result}")
+            except Exception as e:
+                print(f"Warning: Failed to send notification to chunking service: {e}")
+                # Don't fail the entire pipeline if notification fails
+        elif meeting_id and not NOTIFICATION_AVAILABLE:
+            print("Warning: httpx not available, notification skipped")
+        elif not meeting_id:
+            print("Warning: meeting_id not provided, skipping notification")
+
+        # 8. Clean up (if not debug)
         if os.getenv("DEBUG_MODE", "false").lower() != "true":
             shutil.rmtree(user_session_dir)
 
@@ -128,7 +165,9 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
             "status": "success",
             "session_id": session_id,
             "segments": enriched_segments,
-            "path": output_json_path
+            "path": output_json_path,
+            "jsonl_path": output_jsonl_path,
+            "notification_result": notification_result
         }
     except Exception as e:
         raise RuntimeError(f"Pipeline failed: {e}")
