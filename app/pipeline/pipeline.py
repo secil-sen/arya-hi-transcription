@@ -14,6 +14,7 @@ from app.pipeline.utils import save_as_json, filter_short_segments
 from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
 from app.pipeline.rule_based_name_extraction import apply_name_extraction_to_segments
+from collections import Counter, defaultdict
 try:
     from app.pipeline.notification import notify_chunking, save_as_jsonl
     NOTIFICATION_AVAILABLE = True
@@ -35,6 +36,117 @@ def _download_if_url(path: str, target_dir: str) -> str:
         print(f"Download finished: {local_path}")
         return local_path
     return path
+
+
+def apply_speaker_name_mapping(segments):
+    """
+    Apply extracted names to speaker IDs based on co-occurrence and confidence.
+
+    This function creates a mapping from speaker IDs (spk_0, spk_1, etc.) to
+    actual names based on the extracted_names field in each segment.
+
+    Args:
+        segments: List of transcript segments with extracted_names field
+
+    Returns:
+        List of segments with speaker field updated to use actual names
+    """
+    if not segments:
+        return segments
+
+    # Count name occurrences per speaker
+    speaker_name_counts = defaultdict(Counter)
+    speaker_total_duration = defaultdict(float)
+
+    # Collect statistics
+    for seg in segments:
+        speaker_id = seg.get("speaker", "")
+        if not speaker_id or not speaker_id.startswith("spk_"):
+            continue
+
+        duration = seg.get("end", 0) - seg.get("start", 0)
+        speaker_total_duration[speaker_id] += duration
+
+        # Count extracted names for this speaker
+        extracted_names = seg.get("extracted_names", [])
+        for name in extracted_names:
+            if name and name.strip():
+                clean_name = name.strip()
+                # Filter out generic terms and very short names
+                if (len(clean_name) > 1 and
+                    not clean_name.lower() in ['speaker', 'spk', 'unknown', 'speaker 1', 'speaker 2']):
+                    speaker_name_counts[speaker_id][clean_name] += 1
+
+    # Build speaker mapping
+    speaker_mapping = {}
+    assigned_names = set()
+
+    print(f"Building speaker name mapping from {len(speaker_name_counts)} speakers...")
+
+    # Sort speakers by total speaking duration (longer speakers get priority)
+    sorted_speakers = sorted(speaker_total_duration.items(), key=lambda x: x[1], reverse=True)
+
+    for speaker_id, duration in sorted_speakers:
+        if speaker_id not in speaker_name_counts:
+            continue
+
+        name_counts = speaker_name_counts[speaker_id]
+        if not name_counts:
+            continue
+
+        # Get most frequent name for this speaker
+        most_common = name_counts.most_common()
+
+        # Try to find a name that hasn't been assigned yet
+        chosen_name = None
+        for name, count in most_common:
+            # Simple heuristics for name quality
+            if (count >= 1 and  # At least mentioned once
+                name not in assigned_names and  # Not already assigned
+                len(name.split()) <= 3 and  # Not too long
+                not any(char.isdigit() for char in name) and  # No numbers
+                len(name) >= 2):  # At least 2 characters
+                chosen_name = name
+                break
+
+        # If no name found with strict criteria, try looser criteria for common Turkish names
+        if not chosen_name:
+            for name, count in most_common:
+                if (count >= 1 and
+                    name not in assigned_names and
+                    len(name) >= 2 and
+                    # Check if it looks like a Turkish name (contains Turkish characters or common patterns)
+                    (any(char in name for char in 'ÇĞİÖŞÜçğıöşü') or
+                     name.lower() in ['irem', 'İrem', 'samet', 'ufuk', 'ahmet', 'mehmet', 'ali', 'veli', 'can', 'emre'])):
+                    chosen_name = name
+                    break
+
+        if chosen_name:
+            speaker_mapping[speaker_id] = chosen_name
+            assigned_names.add(chosen_name)
+            print(f"  {speaker_id} -> '{chosen_name}' (mentioned {name_counts[chosen_name]} times, {duration:.1f}s total)")
+        else:
+            print(f"  {speaker_id} -> no suitable name found (keeping original)")
+
+    # Apply mapping to segments
+    updated_segments = []
+    for seg in segments:
+        new_seg = seg.copy()
+        speaker_id = seg.get("speaker", "")
+
+        if speaker_id in speaker_mapping:
+            new_seg["speaker"] = speaker_mapping[speaker_id]
+            # Keep original speaker_id for reference
+            new_seg["original_speaker_id"] = speaker_id
+
+        updated_segments.append(new_seg)
+
+    # Summary
+    mapped_count = len(speaker_mapping)
+    total_speakers = len(set(seg.get("speaker", "") for seg in segments if seg.get("speaker", "").startswith("spk_")))
+    print(f"Speaker mapping complete: {mapped_count}/{total_speakers} speakers mapped to names")
+
+    return updated_segments
 
 
 def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
@@ -222,6 +334,10 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
             print("Warning: httpx not available, notification skipped")
         elif not meeting_id:
             print("Warning: meeting_id not provided, skipping notification")
+
+        # Step 7: Apply extracted names to speaker IDs
+        print("Applying extracted names to speaker IDs...")
+        enriched_segments = apply_speaker_name_mapping(enriched_segments)
 
         # 8. Clean up (if not debug)
         if os.getenv("DEBUG_MODE", "false").lower() != "true":
