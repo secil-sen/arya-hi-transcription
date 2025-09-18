@@ -5,23 +5,22 @@ description = "Video to transcript service"
 authors = [{ name = "Secil Sen" }]
 readme = "README.md"
 requires-python = ">=3.9"
-
 dependencies = [
     "fastapi>=0.116.1,<0.117.0",
     "uvicorn>=0.35.0,<0.36.0",
     "google-generativeai>=0.8.0,<1.0.0",
     "pandas>=2.3.1,<3.0.0",
     "python-dotenv>=1.1.1,<2.0.0",
-    "numpy<2.0",
-    "scipy",
-    "librosa",
+    "numpy>=1.21.0,<2.0",
+    "scipy>=1.7.0",
+    "librosa>=0.9.0",
     "pydub>=0.25.1,<0.26.0",
-    "json5 (>=0.12.0,<0.13.0)",
-    "soundfile (>=0.13.1,<0.14.0)",
+    "json5>=0.12.0,<0.13.0",
+    "soundfile>=0.13.1,<0.14.0",
     "openai-whisper",
-    "pyannote.audio",
-    "torch",
-    "torchaudio",
+    "pyannote.audio>=3.1.1",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
     "aiohttp<3.9.0",
     "httpx>=0.24.0,<1.0.0",
     "rapidfuzz>=3.0.0,<4.0.0"
@@ -46,19 +45,17 @@ uvicorn = ">=0.35.0,<0.36.0"
 google-generativeai = ">=0.8.0,<1.0.0"
 pandas = ">=2.3.1,<3.0.0"
 python-dotenv = ">=1.1.1,<2.0.0"
-numpy = "<2.0"
-scipy = "*"
-librosa = "*"
+numpy = ">=1.21.0,<2.0"
+scipy = ">=1.7.0"
+librosa = ">=0.9.0"
 pydub = ">=0.25.1,<0.26.0"
 json5 = ">=0.12.0,<0.13.0"
 soundfile = ">=0.13.1,<0.14.0"
-"openai-whisper" = "*"
-"pyannote-audio" = "*"
-torch = ">=1.13.0,<2.0.0"
-torchaudio = ">=0.13.0,<2.0.0"
+openai-whisper = "*"
+"pyannote.audio" = ">=3.1.1"
+torch = ">=2.0.0"
+torchaudio = ">=2.0.0"
 aiohttp = "<3.9.0"
 httpx = ">=0.24.0,<1.0.0"
 rapidfuzz = ">=3.0.0,<4.0.0"
-matplotlib = ">=3.5.0,<3.7.0"
-torchmetrics = ">=0.9.0,<0.12.0"
-pytorch-lightning = ">=1.8.0,<2.0.0"
+matplotlib = ">=3.5.0"

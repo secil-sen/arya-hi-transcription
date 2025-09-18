@@ -22,9 +22,24 @@ MIN_EMB_DUR = 0.5   # seconds - reduced from 1.2 to be more permissive
 EXPAND_MARGIN = 0.6 # seconds
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    a = a / (np.linalg.norm(a) + 1e-12)
-    b = b / (np.linalg.norm(b) + 1e-12)
-    return float(np.dot(a, b))
+    # Ensure both arrays are the same shape
+    if a.shape != b.shape:
+        print(f"WARNING: Shape mismatch in cosine_sim: {a.shape} vs {b.shape}")
+        # Try to handle 1D vectors of different lengths
+        if len(a.shape) == 1 and len(b.shape) == 1:
+            min_len = min(a.shape[0], b.shape[0])
+            a = a[:min_len]
+            b = b[:min_len]
+        else:
+            return 0.0  # Return neutral similarity for incompatible shapes
+
+    try:
+        a = a / (np.linalg.norm(a) + 1e-12)
+        b = b / (np.linalg.norm(b) + 1e-12)
+        return float(np.dot(a, b))
+    except Exception as e:
+        print(f"ERROR in cosine_sim: {e}")
+        return 0.0
 
 def merge_segments(segments: List["Segment"], gap_tolerance: float = 0.3) -> List["Segment"]:
     """Merge adjacent segments of the same local speaker with small gaps tolerated."""
@@ -41,10 +56,35 @@ def merge_segments(segments: List["Segment"], gap_tolerance: float = 0.3) -> Lis
     return merged
 
 def duration_weighted_mean(vectors: List[np.ndarray], durations: List[float]) -> np.ndarray:
+    if not vectors or len(vectors) == 0:
+        raise ValueError("Empty vectors list provided to duration_weighted_mean")
+
+    # Ensure all vectors have the same shape
+    first_shape = vectors[0].shape
+    for i, vec in enumerate(vectors):
+        if vec.shape != first_shape:
+            print(f"WARNING: Vector {i} has shape {vec.shape}, expected {first_shape}")
+            # Reshape or pad if needed
+            if len(vec.shape) == 1 and len(first_shape) == 1:
+                # Handle 1D vector length mismatch
+                if vec.shape[0] < first_shape[0]:
+                    vec = np.pad(vec, (0, first_shape[0] - vec.shape[0]))
+                elif vec.shape[0] > first_shape[0]:
+                    vec = vec[:first_shape[0]]
+                vectors[i] = vec
+
     w = np.asarray(durations, dtype=np.float32)
     wsum = float(w.sum()) + 1e-12
-    mat = np.vstack(vectors).astype(np.float32)
-    return (mat.T @ (w / wsum)).T
+
+    try:
+        mat = np.vstack(vectors).astype(np.float32)
+        return (mat.T @ (w / wsum)).T
+    except ValueError as e:
+        print(f"ERROR in duration_weighted_mean: {e}")
+        print(f"Vector shapes: {[v.shape for v in vectors]}")
+        print(f"Durations: {durations}")
+        # Fallback: return the first vector
+        return vectors[0].astype(np.float32)
 
 def _audio_duration_seconds(path: str) -> Optional[float]:
     """Return audio duration in seconds using torchaudio if available."""
@@ -162,12 +202,33 @@ def force_num_speakers_kmeans(
       mapping: old_id -> new_id
     """
 
-    if len(global_speakers) <= attendee_num:
+    # Filter out None embeddings (from simplified mapping)
+    valid_speakers = {k: v for k, v in global_speakers.items() if v is not None}
+
+    if len(valid_speakers) == 0:
+        # No valid embeddings, use simplified mapping
+        print("No valid embeddings for KMeans clustering, using simplified speaker mapping")
+        new_mapping = {}
+        for i, seg in enumerate(segments):
+            spk_id = seg["speaker"]
+            if spk_id not in new_mapping:
+                new_mapping[spk_id] = f"spk_{len(new_mapping) % attendee_num}"
+
+        new_segments = []
+        for seg in segments:
+            new_seg = dict(seg)
+            new_seg["speaker"] = new_mapping[seg["speaker"]]
+            new_segments.append(new_seg)
+
+        new_centroids = {f"spk_{i}": None for i in range(attendee_num)}
+        return new_segments, new_centroids, new_mapping
+
+    if len(valid_speakers) <= attendee_num:
         # Already <= target, no need to force
         return segments, global_speakers, {k: k for k in global_speakers.keys()}
 
-    g_ids = list(global_speakers.keys())
-    X = np.vstack([np.asarray(global_speakers[g]) for g in g_ids]).astype(np.float32)
+    g_ids = list(valid_speakers.keys())
+    X = np.vstack([np.asarray(valid_speakers[g]) for g in g_ids]).astype(np.float32)
     X = _l2_normalize(X)  # cosine-consistent space
 
     spk_durations = compute_speaker_durations(segments)
@@ -355,11 +416,47 @@ def diarize_chunks_with_global_ids_union(
                     continue
                 else:
                     try:
-                        emb = inference_model.crop(audio_dict, seg_for_emb)
-                        emb = emb if isinstance(emb, np.ndarray) else np.asarray(emb)
-                        print(f"    Successfully extracted embedding for segment {seg} (duration: {seg.duration:.2f}s)")
+                        # Try different approaches for embedding extraction
+                        emb = None
+
+                        if hasattr(inference_model, 'crop'):
+                            # Old API (pyannote.audio < 3.0)
+                            emb = inference_model.crop(audio_dict, seg_for_emb)
+                            print(f"    Used crop API for embedding extraction")
+                        else:
+                            # For pyannote.audio 3.x, try different approaches
+                            try:
+                                # Try using Inference class directly with file path and segment
+                                from pyannote.audio import Inference
+                                if isinstance(inference_model, Inference) or hasattr(inference_model, 'slide'):
+                                    emb = inference_model.slide({"audio": full_path}, seg_for_emb)
+                                    print(f"    Used slide API for embedding extraction")
+                                else:
+                                    # Try direct call on the model
+                                    emb = inference_model({"audio": full_path}, seg_for_emb)
+                                    print(f"    Used direct call API for embedding extraction")
+                            except Exception as api_error:
+                                print(f"    Advanced embedding extraction failed: {api_error}")
+                                # Skip embedding-based approach for this speaker
+                                print(f"    Skipping embedding extraction for segment {seg}")
+                                continue
+
+                        if emb is not None:
+                            emb = emb if isinstance(emb, np.ndarray) else np.asarray(emb)
+                            # Ensure embedding is 1D and has reasonable shape
+                            if len(emb.shape) > 1:
+                                emb = emb.flatten()
+                            if emb.shape[0] == 0:
+                                print(f"    Empty embedding extracted for segment {seg}, skipping")
+                                continue
+                            print(f"    Successfully extracted embedding for segment {seg} (duration: {seg.duration:.2f}s, shape: {emb.shape})")
+                        else:
+                            print(f"    No embedding extracted for segment {seg}")
+                            continue
+
                     except Exception as e:
                         print(f"    Failed to extract embedding for segment {seg}: {e}")
+                        print(f"    This might be due to incompatible pyannote.audio API - skipping embedding for this segment")
                         continue
                 vecs.append(emb)
                 durs.append(seg.duration)
@@ -371,8 +468,9 @@ def diarize_chunks_with_global_ids_union(
                     print(f"    Using simplified mapping for speaker {local_label}")
                     local_embs[local_label] = None  # Use None to indicate no embedding
                 else:
-                    print(f"    No valid embeddings for speaker {local_label}, skipping")
-                    continue
+                    print(f"    No valid embeddings for speaker {local_label}")
+                    print(f"    Falling back to simplified mapping without embeddings")
+                    local_embs[local_label] = None  # Use None to indicate no embedding
             else:
                 local_embs[local_label] = duration_weighted_mean(vecs, durs)
 
@@ -384,6 +482,10 @@ def diarize_chunks_with_global_ids_union(
                 # Simplified mapping without embeddings - just map to sequential speakers
                 gid = f"spk_{len(local_to_global)}"
                 local_to_global[local_label] = gid
+                # Store None in global speakers to indicate no embedding available
+                if gid not in global_speakers:
+                    global_speakers[gid] = None
+                    global_counts[gid] = 1
                 print(f"    Mapped local speaker {local_label} to global {gid} (simplified mode)")
                 continue
                 

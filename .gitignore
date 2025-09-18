@@ -1,6 +1,7 @@
 # JetBrains / PyCharm
 .idea/
 *.iml
+.claude/
 
 # Python
 __pycache__/

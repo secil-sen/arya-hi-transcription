@@ -5,7 +5,7 @@ ROOT_PATH = Path(__file__).resolve().parent.parent
 
 DEFAULT_OUTPUT_ROOT = "/tmp/transcripts"
 
-DIARIZATION_MODEL_NAME = "pyannote/speaker-diarization"
+DIARIZATION_MODEL_NAME = "pyannote/speaker-diarization-3.1"
 DIARIZATION_CHUNK_DIR = ROOT_PATH / "chunks"
 GEMINI_MODEL_NAME = "gemini-1.5-flash"
 CHUNK_LENGTH = 240
