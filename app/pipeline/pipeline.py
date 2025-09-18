@@ -13,6 +13,7 @@ from app.pipeline.transcription import run_whisper_transcription
 from app.pipeline.utils import save_as_json, filter_short_segments
 from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
+from app.pipeline.rule_based_name_extraction import apply_name_extraction_to_segments
 try:
     from app.pipeline.notification import notify_chunking, save_as_jsonl
     NOTIFICATION_AVAILABLE = True
@@ -124,6 +125,71 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
             print(f"First enriched segment: {enriched_segments[0]}")
         else:
             print("WARNING: No segments after Gemini processing!")
+
+        # Step 5: Apply rule-based name extraction
+        print("Applying rule-based name extraction...")
+        start_time = __import__('time').time()
+        
+        try:
+            # Only apply name extraction if we have segments and attendees
+            if enriched_segments and attendees:
+                # NER Configuration - Using bert-base model (much safer than xlm-roberta)
+                # Your selected model: "Davlan/bert-base-multilingual-cased-ner-hrl"
+                # Heavy model (avoid): "Davlan/xlm-roberta-base-ner-hrl" 
+                ner_model = "Davlan/bert-base-multilingual-cased-ner-hrl"
+                print(f"🤖 NER MODEL ENABLED: {ner_model}")
+                print("   Using BERT-base model (safer than XLM-RoBERTa)")
+                
+                enriched_segments = apply_name_extraction_to_segments(
+                    segments=enriched_segments,
+                    attendees=attendees,
+                    ner_model=ner_model,
+                    tau_ms=90000,  # 90 seconds temporal window
+                    threshold=0.4,  # Minimum confidence threshold
+                    spk_strong_thr=1.5,  # Speaker canonical assignment threshold
+                    spk_margin=0.6,  # Margin between top candidates
+                    spk_min_dur_ms=3000  # Minimum speaker duration (3 seconds)
+                )
+                
+                # Count segments with extracted names
+                segments_with_names = sum(1 for seg in enriched_segments if seg.get("extracted_names"))
+                total_names = sum(len(seg.get("extracted_names", [])) for seg in enriched_segments)
+                
+                elapsed_time = __import__('time').time() - start_time
+                print(f"✅ Name extraction completed in {elapsed_time:.2f}s")
+                print(f"   - {segments_with_names}/{len(enriched_segments)} segments have extracted names")
+                print(f"   - Total names extracted: {total_names}")
+                
+                if enriched_segments and enriched_segments[0].get("extracted_names"):
+                    print(f"   - Sample names (first segment): {enriched_segments[0].get('extracted_names', [])}")
+                
+                # Debug: Show all extracted names for verification
+                print("   - All extracted names by segment:")
+                for i, seg in enumerate(enriched_segments[:5]):  # Show first 5 segments
+                    names = seg.get('extracted_names', [])
+                    if names:
+                        print(f"     Segment {i+1}: {names}")
+                    else:
+                        print(f"     Segment {i+1}: (no names)")
+                if len(enriched_segments) > 5:
+                    print(f"     ... and {len(enriched_segments) - 5} more segments")
+            else:
+                print("⚠️  Skipping name extraction: No segments or attendees provided")
+                # Add empty extracted_names field to all segments
+                for seg in enriched_segments:
+                    seg["extracted_names"] = []
+                    
+        except ImportError as e:
+            print(f"⚠️  Name extraction dependency missing: {e}")
+            print("   Installing rapidfuzz: pip install rapidfuzz")
+            # Add empty extracted_names field to all segments
+            for seg in enriched_segments:
+                seg["extracted_names"] = []
+        except Exception as e:
+            print(f"⚠️  Name extraction failed: {e}")
+            # Continue pipeline even if name extraction fails
+            for seg in enriched_segments:
+                seg["extracted_names"] = []
 
         # Step 6: Save output as JSONL (if notification available)
         output_jsonl_path = os.path.join(user_session_dir, "transcript.jsonl")
