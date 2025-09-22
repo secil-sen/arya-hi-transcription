@@ -4,6 +4,9 @@ import requests
 import json
 from uuid import uuid4
 import asyncio
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+from urllib.parse import urlparse
 
 from typing import List, Optional
 
@@ -24,17 +27,64 @@ except ImportError:
 
 
 def _download_if_url(path: str, target_dir: str) -> str:
-    """Eğer path bir http/https URL ise önce indirip local path döndürür."""
+    """Downloads file if path is a URL. Supports both regular HTTP/HTTPS and S3 URLs."""
     if path.startswith("http://") or path.startswith("https://"):
         local_path = os.path.join(target_dir, "input.mp4")
         print(f"Downloading remote MP4 to {local_path} ...")
-        r = requests.get(path, stream=True)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"Download finished: {local_path}")
-        return local_path
+
+        # Check if this is an S3 URL
+        parsed_url = urlparse(path)
+        if '.s3.' in parsed_url.netloc and 'amazonaws.com' in parsed_url.netloc:
+            try:
+                # Extract bucket and key from S3 URL
+                if parsed_url.netloc.startswith('s3.'):
+                    # Format: https://s3.amazonaws.com/bucket/key or https://s3.region.amazonaws.com/bucket/key
+                    bucket_name = parsed_url.path.split('/')[1]
+                    object_key = '/'.join(parsed_url.path.split('/')[2:])
+                else:
+                    # Format: https://bucket.s3.region.amazonaws.com/key
+                    bucket_name = parsed_url.netloc.split('.')[0]
+                    object_key = parsed_url.path.lstrip('/')
+
+                print(f"Detected S3 URL - Bucket: {bucket_name}, Key: {object_key}")
+
+                # Initialize S3 client
+                s3_client = boto3.client('s3')
+
+                # Download file from S3
+                print(f"Downloading from S3: s3://{bucket_name}/{object_key}")
+                s3_client.download_file(bucket_name, object_key, local_path)
+                print(f"S3 download finished: {local_path}")
+                return local_path
+
+            except NoCredentialsError:
+                print("Error: AWS credentials not found. Please configure AWS credentials.")
+                print("You can set them using:")
+                print("- Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
+                print("- AWS credentials file (~/.aws/credentials)")
+                print("- IAM role (if running on EC2)")
+                raise RuntimeError("AWS credentials not configured for S3 access")
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'NoSuchBucket':
+                    raise RuntimeError(f"S3 bucket '{bucket_name}' does not exist")
+                elif error_code == 'NoSuchKey':
+                    raise RuntimeError(f"S3 object '{object_key}' does not exist in bucket '{bucket_name}'")
+                elif error_code == 'AccessDenied':
+                    raise RuntimeError(f"Access denied to S3 object. Check your AWS permissions for s3://{bucket_name}/{object_key}")
+                else:
+                    raise RuntimeError(f"S3 error: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to download from S3: {e}")
+        else:
+            # Regular HTTP/HTTPS download
+            r = requests.get(path, stream=True)
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"Download finished: {local_path}")
+            return local_path
     return path
 
 
