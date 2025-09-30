@@ -9,9 +9,25 @@ except ImportError:
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel
+    VERTEX_AI_AVAILABLE = True
+except ImportError:
+    VERTEX_AI_AVAILABLE = False
 from app.core.config import (WHISPER_MODEL_NAME,
                              DIARIZATION_MODEL_NAME,
                              EMBEDDING_MODEL_NAME)
+
+# Import Replicate transcription service (lazy loading)
+try:
+    from app.pipeline.replicate_transcription import get_replicate_service
+    REPLICATE_AVAILABLE = True
+    print("✅ Replicate transcription service available")
+except ImportError as e:
+    REPLICATE_AVAILABLE = False
+    get_replicate_service = None
+    print(f"⚠️  Replicate transcription service not available: {e}")
 
 
 class ModelRegistry:
@@ -32,17 +48,40 @@ class ModelRegistry:
             if not gemini_api_key:
                 raise EnvironmentError("GOOGLE_API_KEY not set.")
 
-            # Configure Google Gemini
-            genai.configure(api_key=gemini_api_key)
-            self._gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-            
-            # Set generation config for better JSON output
-            self._gemini_model.generation_config = genai.types.GenerationConfig(
-                temperature=0.1,  # Lower temperature for more consistent output
-                top_p=0.8,
-                top_k=40,
-                max_output_tokens=2048,
-            )
+            # Check if using Vertex AI or Google AI
+            use_vertex_ai = os.getenv("USE_VERTEX_AI", "false").lower() == "true"
+
+            if use_vertex_ai and VERTEX_AI_AVAILABLE:
+                # Configure Vertex AI
+                project_id = os.getenv("VERTEX_AI_PROJECT_ID")
+                location = os.getenv("VERTEX_AI_LOCATION", "us-central1")
+
+                if not project_id:
+                    raise EnvironmentError("VERTEX_AI_PROJECT_ID not set for Vertex AI usage.")
+
+                vertexai.init(project=project_id, location=location)
+                # Use correct Vertex AI model path format
+                self._gemini_model = GenerativeModel("publishers/google/models/gemini-2.5-flash")
+
+                # Set generation config for Vertex AI
+                self._generation_config = {
+                    "temperature": 0.1,
+                    "top_p": 0.8,
+                    "top_k": 40,
+                    "max_output_tokens": 2048,
+                }
+            else:
+                # Configure Google AI (default)
+                genai.configure(api_key=gemini_api_key)
+                self._gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+
+                # Set generation config for Google AI
+                self._gemini_model.generation_config = genai.types.GenerationConfig(
+                    temperature=0.1,
+                    top_p=0.8,
+                    top_k=40,
+                    max_output_tokens=2048,
+                )
             self._initialized = True
 
     @property
@@ -159,6 +198,15 @@ class ModelRegistry:
                 print("Using diarization pipeline's internal embedding extraction")
                 self._inference = None
         return self._inference
+
+    @property
+    def replicate_transcription(self):
+        """Access Replicate transcription service."""
+        if REPLICATE_AVAILABLE and get_replicate_service is not None:
+            return get_replicate_service()
+        else:
+            print("WARNING: Replicate transcription service not available")
+            return None
 
 load_dotenv()
 models = ModelRegistry() # Global singleton instance.

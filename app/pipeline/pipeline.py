@@ -7,16 +7,24 @@ import asyncio
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 from urllib.parse import urlparse
+from app.utils.path_utils import (
+    get_user_session_path, get_audio_file_path, get_chunks_dir_path,
+    get_debug_dir_path, safe_join, normalize_path
+)
 
 from typing import List, Optional
+
+# 🚀 MONITORING IMPORT - Pipeline'da detaylı metrics için
+from transcript_monitoring import transcript_monitor
 
 from app.pipeline.ffmpeg_utils import convert_mp4_to_wav, split_wav_into_chunks_v2
 from app.pipeline.diarization import diarize_chunks_with_global_ids_union
 from app.pipeline.transcription import run_whisper_transcription
 from app.pipeline.utils import save_as_json, filter_short_segments
-from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3
+from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3, enrich_names_with_gemini
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
 from app.pipeline.rule_based_name_extraction import apply_name_extraction_to_segments
+from app.pipeline.embedding_extraction import extract_embeddings_async
 from collections import Counter, defaultdict
 try:
     from app.pipeline.notification import notify_chunking, save_as_jsonl
@@ -199,11 +207,31 @@ def apply_speaker_name_mapping(segments):
     return updated_segments
 
 
-def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
-                            attendees: Optional[List[str]] = None, meeting_id: Optional[str] = None) -> dict:
+# 🚀 DECORATOR EKLENDİ - Pipeline'da detaylı monitoring!
+@transcript_monitor(
+    user_context=lambda *args, **kwargs: kwargs.get('user_id', 'anonymous'),
+    session_context=lambda *args, **kwargs: kwargs.get('meeting_id'),
+    track_audio_metadata=True,
+    custom_config={
+        "track_performance_metrics": True,
+        "track_quality_metrics": True,
+        "offline_mode": True  # İlk test için offline
+    }
+)
+async def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
+                                  attendees: Optional[List[str]] = None, meeting_id: Optional[str] = None) -> dict:
+    """
+    Video transcript pipeline - şimdi otomatik monitoring ile!
+
+    Decorator otomatik olarak:
+    - Pipeline'ın her aşamasının süresini ölçer
+    - Audio file metadata'sını toplar
+    - Quality metrics hesaplar
+    - User ve session analytics yapar
+    - Background'da Vertex AI'ya gönderir
+    """
     session_id = uuid4().hex
-    user_session_dir = os.path.join(output_root, user_id, session_id)
-    os.makedirs(user_session_dir, exist_ok=True)
+    user_session_dir = get_user_session_path(output_root, user_id, session_id)
 
     # Debug input parameters
     print(f"Starting transcript pipeline:")
@@ -215,17 +243,17 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
     print(f"- Attendees: {attendees}")
     print(f"- User session dir: {user_session_dir}")
 
-    # Safety check for attendees
+    # Handle attendees list - prefer provided list, fallback to dynamic generation
     if not attendees:
-        print("WARNING: No attendees provided, using default")
-        attendees = ["Speaker1", "Speaker2"]  # Default attendees
+        print("INFO: No attendees provided, will use dynamic speaker detection")
+        attendees = []  # Empty list will trigger dynamic detection
 
-    print(f"Using attendees: {attendees}")
+    print(f"Using attendees: {attendees if attendees else 'Dynamic detection'}")
 
     try:
-        wav_path = os.path.join(user_session_dir, "audio.wav")
-        chunk_dir = os.path.join(user_session_dir, "chunks")
-        output_json_path = os.path.join(user_session_dir, "transcript_V7.json")
+        wav_path = get_audio_file_path(user_session_dir, "audio.wav")
+        chunk_dir = get_chunks_dir_path(user_session_dir)
+        output_json_path = safe_join(user_session_dir, "transcript_V7.json")
 
         # NEW: Eğer mp4_path URL ise indir
         mp4_path = _download_if_url(mp4_path, user_session_dir)
@@ -241,11 +269,30 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         chunk_files = [f for f in os.listdir(chunk_dir) if f.endswith('.wav')]
         print(f"Created {len(chunk_files)} chunk files: {chunk_files[:5]}...")  # Show first 5
 
-        # Step 2: Diarization with offset
-        diar_segments, speaker_map = diarize_chunks_with_global_ids_union(
-            chunk_paths=chunk_dir,
-            attendee_num=len(attendees),
+        # Step 2: Diarization with offset (optional if using Replicate with diarization)
+        use_replicate_transcription = (
+            os.getenv("REPLICATE_API_TOKEN") and
+            os.getenv("REPLICATE_API_TOKEN") != "r8_xxx..." and
+            os.getenv("USE_REPLICATE_DIARIZATION", "true").lower() == "true"
         )
+
+        if use_replicate_transcription:
+            print("🎯 Using Replicate with integrated diarization - skipping separate diarization step")
+            # Create minimal segments for Replicate transcription
+            diar_segments = [{
+                "start": 0.0,
+                "end": 240.0,  # Will be updated by Replicate
+                "speaker": "spk_0",
+                "chunk": 0
+            }]
+            speaker_map = {}
+        else:
+            print("🔄 Using traditional diarization pipeline")
+            diar_segments, speaker_map = diarize_chunks_with_global_ids_union(
+                chunk_paths=chunk_dir,
+                attendee_num=len(attendees),
+            )
+
         print(f"Diarization segments count: {len(diar_segments)}")
         if diar_segments:
             print(f"First diarization segment: {diar_segments[0]}")
@@ -265,21 +312,36 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         else:
             print("WARNING: No segments after filtering!")
 
-        # Step 4: Correction and infer with Gemini
+        # Step 4: Generate dynamic attendees if none provided
+        if not attendees and filtered_segments:
+            # Extract unique speakers from diarization results
+            unique_speakers = set()
+            for segment in filtered_segments:
+                speaker = segment.get('speaker', '').strip()
+                if speaker and speaker not in ['UNKNOWN', 'unknown', '']:
+                    unique_speakers.add(speaker)
+
+            # Generate attendee names based on detected speakers
+            attendees = [f"Speaker {i+1}" for i, _ in enumerate(sorted(unique_speakers))]
+            if len(attendees) == 0:
+                attendees = ["Speaker 1", "Speaker 2"]  # Fallback
+
+            print(f"Generated dynamic attendees: {attendees}")
+
+        # Step 5: Correction and infer with Gemini
         attendee_id_map = {f"u_{attendee.lower()}": attendee for attendee in attendees}
 
-        debug_dir = os.path.join(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE",
+        debug_dir = get_debug_dir_path(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE",
                                                                                 "false").lower() == "true" else None
 
-        enriched_segments = asyncio.run(
-            gemini_correct_and_infer_segments_async_v3(
-                segments=filtered_segments,
-                attendee_list=attendees,
-                term_list=TERM_LIST,
-                attendee_id_map=attendee_id_map,
-                enable_json_mode=True,
-                debug_dir=debug_dir
-            )
+        # 🚀 ASYNC FIX - Pipeline artık async, direkt await kullan
+        enriched_segments = await gemini_correct_and_infer_segments_async_v3(
+            segments=filtered_segments,
+            attendee_list=attendees,
+            term_list=TERM_LIST,
+            attendee_id_map=attendee_id_map,
+            enable_json_mode=True,
+            debug_dir=debug_dir
         )
 
         print(f"Enriched segments count: {len(enriched_segments)}")
@@ -288,20 +350,20 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
         else:
             print("WARNING: No segments after Gemini processing!")
 
-        # Step 5: Apply rule-based name extraction
-        print("Applying rule-based name extraction...")
-        start_time = __import__('time').time()
-        
+        # Step 5: Apply rule-based name extraction (NER)
+        print("Applying rule-based name extraction (NER)...")
+        ner_start_time = __import__('time').time()
+
         try:
             # Only apply name extraction if we have segments and attendees
             if enriched_segments and attendees:
                 # NER Configuration - Using bert-base model (much safer than xlm-roberta)
                 # Your selected model: "Davlan/bert-base-multilingual-cased-ner-hrl"
-                # Heavy model (avoid): "Davlan/xlm-roberta-base-ner-hrl" 
+                # Heavy model (avoid): "Davlan/xlm-roberta-base-ner-hrl"
                 ner_model = "Davlan/bert-base-multilingual-cased-ner-hrl"
                 print(f"🤖 NER MODEL ENABLED: {ner_model}")
                 print("   Using BERT-base model (safer than XLM-RoBERTa)")
-                
+
                 enriched_segments = apply_name_extraction_to_segments(
                     segments=enriched_segments,
                     attendees=attendees,
@@ -312,19 +374,19 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
                     spk_margin=0.6,  # Margin between top candidates
                     spk_min_dur_ms=3000  # Minimum speaker duration (3 seconds)
                 )
-                
+
                 # Count segments with extracted names
                 segments_with_names = sum(1 for seg in enriched_segments if seg.get("extracted_names"))
                 total_names = sum(len(seg.get("extracted_names", [])) for seg in enriched_segments)
-                
-                elapsed_time = __import__('time').time() - start_time
-                print(f"✅ Name extraction completed in {elapsed_time:.2f}s")
+
+                ner_elapsed_time = __import__('time').time() - ner_start_time
+                print(f"✅ Name extraction (NER) completed in {ner_elapsed_time:.2f}s")
                 print(f"   - {segments_with_names}/{len(enriched_segments)} segments have extracted names")
                 print(f"   - Total names extracted: {total_names}")
-                
+
                 if enriched_segments and enriched_segments[0].get("extracted_names"):
                     print(f"   - Sample names (first segment): {enriched_segments[0].get('extracted_names', [])}")
-                
+
                 # Debug: Show all extracted names for verification
                 print("   - All extracted names by segment:")
                 for i, seg in enumerate(enriched_segments[:5]):  # Show first 5 segments
@@ -340,7 +402,7 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
                 # Add empty extracted_names field to all segments
                 for seg in enriched_segments:
                     seg["extracted_names"] = []
-                    
+
         except ImportError as e:
             print(f"⚠️  Name extraction dependency missing: {e}")
             print("   Installing rapidfuzz: pip install rapidfuzz")
@@ -352,6 +414,49 @@ def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROO
             # Continue pipeline even if name extraction fails
             for seg in enriched_segments:
                 seg["extracted_names"] = []
+
+        # Step 5.5: Correct extracted names with Gemini
+        print("Correcting extracted names with Gemini...")
+        try:
+            enriched_segments = await enrich_names_with_gemini(enriched_segments)
+        except Exception as e:
+            print(f"⚠️  Name correction with Gemini failed: {e}")
+            # Continue pipeline even if name correction fails
+            pass
+
+        # Step 5.6: Extract embeddings from audio segments
+        print("Extracting speaker embeddings from audio...")
+        embedding_start_time = __import__('time').time()
+
+        try:
+            from app.core.model_registry import models
+
+            # Extract embeddings using the WAV file
+            enriched_segments = await extract_embeddings_async(
+                segments=enriched_segments,
+                audio_path=wav_path,
+                inference_model=models.inference
+            )
+
+            # Count segments with embeddings
+            segments_with_embeddings = sum(1 for seg in enriched_segments if seg.get("embedding") is not None)
+            embedding_elapsed_time = __import__('time').time() - embedding_start_time
+
+            print(f"✅ Embedding extraction completed in {embedding_elapsed_time:.2f}s")
+            print(f"   - {segments_with_embeddings}/{len(enriched_segments)} segments have embeddings")
+
+            if segments_with_embeddings > 0:
+                sample_dim = enriched_segments[0].get("embedding_dim", "unknown")
+                print(f"   - Embedding dimension: {sample_dim}")
+
+        except Exception as e:
+            print(f"⚠️  Embedding extraction failed: {e}")
+            print("   Continuing pipeline without embeddings...")
+            # Add None embeddings to all segments
+            for seg in enriched_segments:
+                if "embedding" not in seg:
+                    seg["embedding"] = None
+                    seg["embedding_error"] = str(e)
 
         # Step 6: Save output as JSONL (if notification available)
         output_jsonl_path = os.path.join(user_session_dir, "transcript.jsonl")

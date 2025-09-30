@@ -378,3 +378,159 @@ async def gemini_correct_and_infer_segments_async_v3(
         print(f"Sample result: {results[0]}")
     
     return results
+
+
+# -------- Name Correction with Gemini --------
+
+NAME_CORRECTION_PROMPT = """
+Sen bir isim düzeltme asistanısın. Sana verilen transkript segmentinde geçen isimleri analiz et ve hataları düzelt.
+
+**Kurallar:**
+1. Marka isimleri büyük harfle yazılmalı (ARYA, IBM, AWS gibi)
+2. Türkçe karakter hataları düzeltilmeli (gürkem → Görkem, şükrü → Şükrü)
+3. İngilizce isimler düzgün kapitalize edilmeli (john → John, mary → Mary)
+4. Yaygın yazım hataları düzeltilmeli (aria → ARYA, arial → ARYA, jon → John)
+5. Baş harfleri büyük olmalı (örn: görkem çetin → Görkem Çetin)
+
+**Input Segment:**
+{segment_text}
+
+**Çıkarılan İsimler:**
+{extracted_names}
+
+**Beklenen Çıktı (JSON):**
+{{
+    "corrected_names": [
+        {{"original": "aria", "corrected": "ARYA", "type": "brand"}},
+        {{"original": "gürkem", "corrected": "Görkem", "type": "person"}}
+    ]
+}}
+
+Sadece JSON formatında cevap ver, açıklama ekleme. ÖNEMLI: Eğer tüm isimler zaten doğruysa, boş bir liste dön: {{"corrected_names": []}}
+"""
+
+
+async def enrich_names_with_gemini(segments: List[Dict]) -> List[Dict]:
+    """
+    NER ile çıkarılan isimleri Gemini'ye gönderip hataları düzeltir.
+
+    Örnek:
+    - "Aria" → "ARYA" (marka ismi)
+    - "gürkem" → "Görkem" (türkçe karakter)
+    - "jon doe" → "John Doe" (İngilizce isim)
+
+    Args:
+        segments: NER extraction sonrası segment listesi (extracted_names field ile)
+
+    Returns:
+        Düzeltilmiş isimlerle güncellenmiş segment listesi
+    """
+
+    import time
+    from app.core.model_registry import models
+
+    start_time = time.time()
+    corrections_count = 0
+    correction_examples = []
+
+    print("Starting name correction with Gemini...")
+
+    for idx, segment in enumerate(segments):
+        # NER'den çıkan isimler varsa
+        if segment.get('extracted_names') and len(segment['extracted_names']) > 0:
+
+            segment_text = segment.get('text_corrected', segment.get('text', ''))
+            extracted_names = segment['extracted_names']
+
+            prompt = NAME_CORRECTION_PROMPT.format(
+                segment_text=segment_text,
+                extracted_names=', '.join(extracted_names)
+            )
+
+            try:
+                # Gemini'ye gönder
+                response = await asyncio.to_thread(
+                    models.gemini_model.generate_content,
+                    prompt
+                )
+
+                # Extract content from Gemini response
+                content = response.text if hasattr(response, 'text') else str(response)
+
+                # Debug logging
+                print(f"Segment {idx} - Name correction raw response: {content[:200]}...")
+
+                # Safety check for empty response
+                if not content or content.strip() == "":
+                    print(f"⚠️  Segment {idx}: Empty response from Gemini for name correction")
+                    continue
+
+                # Clean and parse JSON response
+                cleaned_content = _clean_content_for_json(content)
+
+                # Try to parse as JSON directly
+                corrected_data = None
+                try:
+                    corrected_data = json.loads(cleaned_content)
+                except json.JSONDecodeError:
+                    # Try to extract JSON from text
+                    try:
+                        json_match = re.search(r'\{[\s\S]*\}', cleaned_content)
+                        if json_match:
+                            corrected_data = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        pass
+
+                if corrected_data is None:
+                    print(f"⚠️  Segment {idx}: Failed to parse Gemini response for name correction")
+                    print(f"   Raw content: {content[:300]}")
+                    continue
+
+                # Handle corrected names
+                corrected_names_list = corrected_data.get('corrected_names', [])
+
+                # If corrected_names is empty, no corrections needed
+                if not corrected_names_list or len(corrected_names_list) == 0:
+                    print(f"   Segment {idx}: No corrections needed")
+                    continue
+
+                # Create mapping from original to corrected
+                correction_map = {}
+                for item in corrected_names_list:
+                    if isinstance(item, dict) and 'original' in item and 'corrected' in item:
+                        correction_map[item['original']] = item['corrected']
+
+                # Update extracted_names with corrections
+                updated_names = []
+                for name in extracted_names:
+                    corrected_name = correction_map.get(name, name)
+                    updated_names.append(corrected_name)
+
+                    # Track corrections for logging
+                    if corrected_name != name:
+                        corrections_count += 1
+                        if len(correction_examples) < 5:  # Keep first 5 examples
+                            correction_examples.append(f"{name} → {corrected_name}")
+
+                # Update segment with corrected names
+                segment['extracted_names'] = updated_names
+                segment['corrected_names_metadata'] = corrected_names_list
+
+                print(f"   Segment {idx}: Corrected {len(correction_map)} names")
+
+            except Exception as e:
+                print(f"⚠️  Segment {idx}: Name correction failed - {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue with original names
+                continue
+
+    elapsed_time = time.time() - start_time
+
+    # Logging
+    print(f"✅ Name correction completed in {elapsed_time:.2f}s")
+    print(f"   - {corrections_count} names corrected")
+    if correction_examples:
+        print(f"   - Corrections: {', '.join(correction_examples)}")
+
+    return segments
