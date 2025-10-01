@@ -36,3 +36,4 @@ Thumbs.db
 .env
 .env.*
 .transcript-evaluator-key.json
+transcript-evaluator-key.json
