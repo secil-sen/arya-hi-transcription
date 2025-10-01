@@ -35,3 +35,4 @@ Thumbs.db
 # Env / secrets
 .env
 .env.*
+.transcript-evaluator-key.json
