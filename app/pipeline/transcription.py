@@ -15,6 +15,15 @@ try:
 except Exception as e:
     raise ImportError("ffmpeg_utils.cut_segment bulunamadı. İmzası: cut_segment(input_wav, output_wav, start_s, end_s, idx)") from e
 
+# Import Replicate transcription
+try:
+    from app.pipeline.replicate_whisper_transcription import run_replicate_whisper_transcription_for_segments
+    REPLICATE_TRANSCRIPTION_AVAILABLE = True
+    print("✅ Replicate transcription available")
+except ImportError as e:
+    REPLICATE_TRANSCRIPTION_AVAILABLE = False
+    print(f"⚠️  Replicate transcription not available: {e}")
+
 
 def _hop() -> float:
     """Overlapped chunk'larda ofset = i * (CHUNK_LENGTH - CHUNK_OVERLAP)."""
@@ -34,6 +43,54 @@ def _find_chunk_file(chunk_dir: str, chunk_index: int) -> Optional[str]:
 
 def run_whisper_transcription(segments: List[Dict[str, Any]], chunk_dir: str, language: str = "tr") -> List[Dict[str, Any]]:
     """
+    Transcription using Replicate's Incredibly Fast Whisper as primary method,
+    with fallback to original segment-based Whisper transcription.
+
+    Parametreler
+    -----------
+    segments : List[Dict]
+        Diarization çıktısı. En az 'start', 'end', 'speaker', 'chunk' alanları beklenir.
+    chunk_dir : str
+        chunk_XXXX.wav dosyalarının bulunduğu dizin.
+    language : str
+        Whisper dil kodu (varsayılan: "tr").
+
+    Dönüş
+    -----
+    List[Dict] : Her öğe {start, end, speaker, text}
+    """
+
+    # Check if Replicate transcription is available and API token is configured
+    use_replicate = REPLICATE_TRANSCRIPTION_AVAILABLE
+
+    replicate_token = os.getenv("REPLICATE_API_TOKEN")
+    if replicate_token == "r8_xxx..." or not replicate_token:
+        print("⚠️  REPLICATE_API_TOKEN not configured properly, falling back to local Whisper")
+        use_replicate = False
+
+    # Try Replicate transcription first
+    if use_replicate:
+        try:
+            print("🚀 Using Replicate Incredibly Fast Whisper for transcription...")
+            return run_replicate_whisper_transcription_for_segments(
+                segments=segments,
+                chunk_dir=chunk_dir,
+                language=language
+            )
+        except Exception as e:
+            print(f"❌ Replicate transcription failed: {e}")
+            print("🔄 Falling back to original Whisper transcription...")
+
+    # Fallback to original segment-based Whisper transcription
+    print("🔄 Using original segment-based Whisper transcription...")
+    return run_original_whisper_transcription(segments, chunk_dir, language)
+
+
+def run_original_whisper_transcription(segments: List[Dict[str, Any]], chunk_dir: str, language: str = "tr") -> List[Dict[str, Any]]:
+    """
+    Original segment-based Whisper transcription (renamed for clarity).
+    This is the fallback method when Replicate is not available or fails.
+
     Diarization segmentleri için, ilgili chunk dosyasından FFmpeg ile kesit alıp Whisper ile transkribe eder.
     - Ofset hesabı overlap-aware'dır: offset = chunk_index * (CHUNK_LENGTH - CHUNK_OVERLAP).
     - start/end değerleri chunk yereline çevrilip aralık dışına taşma varsa kırpılır.

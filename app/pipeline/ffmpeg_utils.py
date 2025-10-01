@@ -1,4 +1,5 @@
 import os
+from typing import List, Optional
 
 from pydub import AudioSegment
 import subprocess
@@ -29,6 +30,12 @@ def convert_mp4_to_wav(input_path: str, output_path: str) -> None:
     Raises:
         RuntimeError: If ffmpeg fails
     """
+    print(f"Converting MP4 to WAV: {input_path} -> {output_path}")
+    
+    # Check if input file exists
+    if not os.path.exists(input_path):
+        raise RuntimeError(f"Input file does not exist: {input_path}")
+    
     command = [
         "ffmpeg",
         "-i", input_path,
@@ -39,8 +46,11 @@ def convert_mp4_to_wav(input_path: str, output_path: str) -> None:
     ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(f"FFmpeg conversion successful. Output file size: {os.path.getsize(output_path) if os.path.exists(output_path) else 'file not found'} bytes")
     except subprocess.CalledProcessError as e:
+        print(f"FFmpeg stderr: {e.stderr}")
+        print(f"FFmpeg stdout: {e.stdout}")
         raise RuntimeError(f"FFmpeg conversion failed: {e}")
 
 def split_wav_into_chunks(wav_path:str, chunk_dir:str, chunk_length = CHUNK_LENGTH) -> None:
@@ -90,16 +100,26 @@ def split_wav_into_chunks_v2(
     os.makedirs(chunk_dir, exist_ok=True)
 
     audio = AudioSegment.from_wav(wav_path)
+    
+    print(f"Audio properties: duration={len(audio)/1000.0:.2f}s, channels={audio.channels}, frame_rate={audio.frame_rate}")
 
     if force_mono and audio.channels != 1:
         audio = audio.set_channels(1)
+        print("Converted to mono")
 
     if target_rate is not None and audio.frame_rate != target_rate:
         audio = audio.set_frame_rate(target_rate)
+        print(f"Resampled to {target_rate} Hz")
 
     win_ms = int(chunk_length * 1000.0)
     hop_ms = int((chunk_length - overlap) * 1000.0)
     duration_ms = len(audio)
+    
+    print(f"Chunking parameters: chunk_length={chunk_length}s, overlap={overlap}s, window={win_ms}ms, hop={hop_ms}ms")
+    print(f"Audio duration: {duration_ms}ms ({duration_ms/1000.0:.2f}s)")
+    
+    if duration_ms < win_ms:
+        print(f"WARNING: Audio duration ({duration_ms/1000.0:.2f}s) is shorter than chunk length ({chunk_length}s)")
 
     paths: List[str] = []
     i = 0
@@ -121,6 +141,7 @@ def split_wav_into_chunks_v2(
         start_ms += hop_ms
         i += 1
 
+    print(f"Chunking complete: Created {len(paths)} chunks")
     return paths
 
 

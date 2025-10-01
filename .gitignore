@@ -1,6 +1,7 @@
 # JetBrains / PyCharm
 .idea/
 *.iml
+.claude/
 
 # Python
 __pycache__/
@@ -34,3 +35,5 @@ Thumbs.db
 # Env / secrets
 .env
 .env.*
+.transcript-evaluator-key.json
+transcript-evaluator-key.json

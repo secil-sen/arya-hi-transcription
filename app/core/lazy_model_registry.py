@@ -1,5 +1,5 @@
 import whisper
-from pyannote.audio import Pipeline
+from pyannote.pipeline import Pipeline
 import os
 
 class LazyModelRegistry:
@@ -21,7 +21,7 @@ class LazyModelRegistry:
             if not hf_token:
                 raise EnvironmentError("HUGGINGFACE_TOKEN not found.")
             cls._diarization = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization",
+                "pyannote/speaker-diarization-3.1",
                 use_auth_token=hf_token
             )
         return cls._diarization
