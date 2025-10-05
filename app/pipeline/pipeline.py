@@ -3,16 +3,16 @@ import shutil
 import requests
 import json
 from uuid import uuid4
-import asyncio
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 from urllib.parse import urlparse
 from app.utils.path_utils import (
     get_user_session_path, get_audio_file_path, get_chunks_dir_path,
-    get_debug_dir_path, safe_join, normalize_path
+    get_debug_dir_path, safe_join
 )
 
 from typing import List, Optional
+import asyncio
 
 # 🚀 MONITORING IMPORT - Pipeline'da detaylı metrics için
 from transcript_monitoring import transcript_monitor
@@ -277,7 +277,7 @@ async def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTP
         )
 
         if use_replicate_transcription:
-            print("🎯 Using Replicate with integrated diarization - skipping separate diarization step")
+            print(" Using Replicate with integrated diarization - skipping separate diarization step")
             # Create minimal segments for Replicate transcription
             diar_segments = [{
                 "start": 0.0,

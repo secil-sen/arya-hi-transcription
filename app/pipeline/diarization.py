@@ -14,6 +14,7 @@ import numpy as np
 from pyannote.core import Segment
 from app.core.model_registry import models
 from app.pipeline.config import CHUNK_LENGTH, CHUNK_OVERLAP
+from app.utils import l2_normalize_np, duration_weighted_mean_np
 import torchaudio
 from sklearn.cluster import KMeans
 from collections import defaultdict
@@ -395,87 +396,81 @@ def diarize_chunks_with_global_ids_union(
 
         local_embs: Dict[str, np.ndarray] = {}
         audio_dict = {"audio": full_path}
-        
+
         for local_label, turns in local_turns.items():
             merged = merge_segments(turns, gap_tolerance=gap_tolerance)
-            print(f"  Speaker {local_label}: {len(turns)} turns -> {len(merged)} merged segments")
-            
+            print(f"Speaker {local_label}: {len(turns)} turns -> {len(merged)} merged segments")
+
             vecs, durs = [], []
             for seg in merged:
                 seg_for_emb = seg
+
+                # # Minimum embedding duration check (extend short segments)
                 if seg_for_emb.duration < MIN_EMB_DUR:
                     if file_duration_sec is not None:
                         seg_for_emb = _ensure_min_duration(seg_for_emb, file_duration_sec)
                     if seg_for_emb.duration < MIN_EMB_DUR and file_duration_sec is None:
-                        print(f"    Skipping segment {seg} - too short ({seg_for_emb.duration:.2f}s < {MIN_EMB_DUR}s)")
+                        print(f"Skipping segment {seg} - too short ({seg_for_emb.duration:.2f}s < {MIN_EMB_DUR}s)")
                         continue
+
                 if inference_model is None:
-                    # Without embedding model, we'll use simplified speaker mapping
-                    # Skip embedding extraction and use basic label-based mapping
-                    print(f"    Skipping embedding extraction - using basic label mapping")
+                    # If embedding is not available, fall back to basic label mapping mode
+                    print(f"Skipping embedding extraction - using basic label mapping")
                     continue
-                else:
-                    try:
-                        # Try different approaches for embedding extraction
-                        emb = None
 
-                        if hasattr(inference_model, 'crop'):
-                            # Old API (pyannote.audio < 3.0)
-                            emb = inference_model.crop(audio_dict, seg_for_emb)
-                            print(f"    Used crop API for embedding extraction")
-                        else:
-                            # For pyannote.audio 3.x, try different approaches
-                            try:
-                                # Try using Inference class directly with file path and segment
-                                from pyannote.audio import Inference
-                                if isinstance(inference_model, Inference) or hasattr(inference_model, 'slide'):
-                                    emb = inference_model.slide({"audio": full_path}, seg_for_emb)
-                                    print(f"    Used slide API for embedding extraction")
-                                else:
-                                    # Try direct call on the model
-                                    emb = inference_model({"audio": full_path}, seg_for_emb)
-                                    print(f"    Used direct call API for embedding extraction")
-                            except Exception as api_error:
-                                print(f"    Advanced embedding extraction failed: {api_error}")
-                                # Skip embedding-based approach for this speaker
-                                print(f"    Skipping embedding extraction for segment {seg}")
-                                continue
+                try:
+                    # --- Standard way: Segment-based embedding with Inference.crop ---
+                    # crop(...) returns (num_windows_in_segment, D). We will take the window-average and then L2 normalize.
+                    emb_t = inference_model.crop(audio_dict, seg_for_emb)  # torch.Tensor [N, D] veya [D]
+                    if emb_t.ndim == 1:
+                        emb_t = emb_t.unsqueeze(0)
 
-                        if emb is not None:
-                            emb = emb if isinstance(emb, np.ndarray) else np.asarray(emb)
-                            # Ensure embedding is 1D and has reasonable shape
-                            if len(emb.shape) > 1:
-                                emb = emb.flatten()
-                            if emb.shape[0] == 0:
-                                print(f"    Empty embedding extracted for segment {seg}, skipping")
-                                continue
-                            print(f"    Successfully extracted embedding for segment {seg} (duration: {seg.duration:.2f}s, shape: {emb.shape})")
-                        else:
-                            print(f"    No embedding extracted for segment {seg}")
-                            continue
-
-                    except Exception as e:
-                        print(f"    Failed to extract embedding for segment {seg}: {e}")
-                        print(f"    This might be due to incompatible pyannote.audio API - skipping embedding for this segment")
+                    if emb_t.shape[0] == 0:
+                        print(f"Empty embedding for segment {seg_for_emb}, skipping")
                         continue
-                vecs.append(emb)
-                durs.append(seg.duration)
-            
-            print(f"    Extracted {len(vecs)} embeddings for speaker {local_label}")
+
+                    # window mean and L2-normalization
+                    emb_vec = emb_t.mean(dim=0).detach().cpu().numpy()
+                    emb_vec = l2_normalize_np(emb_vec)
+
+                    vecs.append(emb_vec)
+                    durs.append(seg_for_emb.duration)
+                    print(f"OK: emb for {seg_for_emb} -> shape={emb_vec.shape}, dur={seg_for_emb.duration:.2f}s")
+
+                except AttributeError:
+                    try:
+                        emb_t = inference_model.slide(audio_dict, seg_for_emb)  # [N, D]
+                        if emb_t.ndim == 1:
+                            emb_t = emb_t.unsqueeze(0)
+                        if emb_t.shape[0] == 0:
+                            print(f"Empty embedding (slide) for segment {seg_for_emb}, skipping")
+                            continue
+                        emb_vec = emb_t.mean(dim=0).detach().cpu().numpy()
+                        emb_vec = l2_normalize_np(emb_vec)
+                        vecs.append(emb_vec)
+                        durs.append(seg_for_emb.duration)
+                        print(f"Used slide API for {seg_for_emb}")
+                    except Exception as api_fallback_err:
+                        print(f"Failed crop/slide embedding for {seg_for_emb}: {api_fallback_err}")
+                        continue
+                except Exception as e:
+                    print(f"Failed to extract embedding for segment {seg_for_emb}: {e}")
+                    continue
+
+            print(f"Extracted {len(vecs)} embeddings for speaker {local_label}")
+
             if not vecs:
-                if inference_model is None:
-                    # For simplified mode without embeddings, create a placeholder
-                    print(f"    Using simplified mapping for speaker {local_label}")
-                    local_embs[local_label] = None  # Use None to indicate no embedding
-                else:
-                    print(f"    No valid embeddings for speaker {local_label}")
-                    print(f"    Falling back to simplified mapping without embeddings")
-                    local_embs[local_label] = None  # Use None to indicate no embedding
+                # Embedding çıkarılamadıysa, simplified moda düş (global eşleştirme None centroid ile yapılır)
+                local_embs[local_label] = None
+                print(f"No valid embeddings for {local_label} -> simplified mapping")
             else:
-                local_embs[local_label] = duration_weighted_mean(vecs, durs)
+                # Konuşmacı için süre-ağırlıklı ortalama tek vektör
+                spk_vec = duration_weighted_mean_np(vecs, durs)  # np.ndarray [D]
+                spk_vec = l2_normalize_np(spk_vec)
+                local_embs[local_label] = spk_vec
 
         local_to_global: Dict[str, str] = {}
-        print(f"  Processing {len(local_embs)} local speakers for global assignment")
+        print(f"Processing {len(local_embs)} local speakers for global assignment")
         
         for local_label, local_vec in local_embs.items():
             if local_vec is None:
