@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException
-from app.schemas import TranscribeRequest, TranscribeResponse
+from app.schemas import TranscribeRequest, TranscribeResponse, AutoAnalysisNotification
 from app.core.warnings_config import setup_production_environment
 from app.core.error_handler import (
     configure_logging, ErrorHandler, CommonErrors, TranscriptException
 )
 from app.services.transcript_service import TranscriptServiceFactory, TranscriptRequest
+import asyncio
+from typing import Dict, Optional
 
 # Configure production environment early
 setup_production_environment()
@@ -51,6 +53,11 @@ except ImportError as e:
 
 app = FastAPI(title="Arya HI Transcript Extraction API")
 
+# In-memory cache for RAG auto analysis results
+# Structure: {meeting_id: {"data": AutoAnalysisData, "event": asyncio.Event}}
+rag_analysis_cache: Dict[str, Dict] = {}
+RAG_WAIT_TIMEOUT = 30  # seconds
+
 # 🚀 STARTUP EVENT - Monitoring sistemi otomatik başlatma
 @app.on_event("startup")
 async def startup_event():
@@ -77,6 +84,40 @@ async def shutdown_event():
 @app.get("/health")
 def health_check_endpoint():
     return {"status": "healthy", "service": "transcript-api"}
+
+@app.post("/rag/notify")
+async def rag_notify(notification: AutoAnalysisNotification):
+    """
+    Receive auto_analysis_ready notification from RAG service.
+    Stores the result in cache and signals waiting transcribe requests.
+    """
+    meeting_id = notification.meeting_id
+
+    print(f"📥 Received RAG auto_analysis for meeting_id: {meeting_id}")
+    print(f"   - Notification ID: {notification.notification_id}")
+    print(f"   - Processing time: {notification.auto_analysis.processing_time_ms}ms")
+    print(f"   - Chunk count: {notification.auto_analysis.chunk_count}")
+
+    # Store in cache
+    if meeting_id in rag_analysis_cache:
+        rag_analysis_cache[meeting_id]["data"] = notification.auto_analysis
+        # Signal the waiting event
+        rag_analysis_cache[meeting_id]["event"].set()
+        print(f"✅ RAG result stored and event signaled for meeting_id: {meeting_id}")
+    else:
+        # If no one is waiting yet, still store it (they might call /transcribe later)
+        rag_analysis_cache[meeting_id] = {
+            "data": notification.auto_analysis,
+            "event": asyncio.Event()
+        }
+        rag_analysis_cache[meeting_id]["event"].set()
+        print(f"⚠️  No waiting request found, but stored RAG result for meeting_id: {meeting_id}")
+
+    return {
+        "status": "success",
+        "meeting_id": meeting_id,
+        "message": "Auto analysis received and cached"
+    }
 
 # 🚀 YENİ: Monitoring health check endpoint
 @app.get("/monitoring/health")
@@ -122,17 +163,62 @@ async def transcribe_video(request: TranscribeRequest):
     - User ID ve meeting ID'yi track eder
     - Background'da Vertex AI'ya gönderir
     - Error handling yapar
+
+    Yeni: RAG auto_analysis sonucunu bekler ve birleştirip gönderir
     """
     try:
-        # 🚀 MEVCUT KODUNUZ HİÇ DEĞİŞMEDİ!
+        meeting_id = request.meeting_id
+
+        # Initialize cache entry for this meeting if not exists
+        if meeting_id not in rag_analysis_cache:
+            rag_analysis_cache[meeting_id] = {
+                "data": None,
+                "event": asyncio.Event()
+            }
+            print(f"🔄 Created cache entry for meeting_id: {meeting_id}")
+
+        # Run transcript pipeline
+        print(f"🎬 Starting transcript pipeline for meeting_id: {meeting_id}")
         result = await run_transcript_pipeline_async(
             mp4_path=request.video_path,
             user_id=request.user_id,
             attendees=request.attendees,
             meeting_id=request.meeting_id
         )
+        print(f"✅ Transcript pipeline completed for meeting_id: {meeting_id}")
+
+        # Wait for RAG auto_analysis result (with timeout)
+        print(f"⏳ Waiting for RAG auto_analysis (timeout: {RAG_WAIT_TIMEOUT}s)...")
+        try:
+            await asyncio.wait_for(
+                rag_analysis_cache[meeting_id]["event"].wait(),
+                timeout=RAG_WAIT_TIMEOUT
+            )
+
+            # RAG result received
+            auto_analysis_data = rag_analysis_cache[meeting_id]["data"]
+            if auto_analysis_data:
+                print(f"✅ RAG auto_analysis received for meeting_id: {meeting_id}")
+                result["auto_analysis"] = auto_analysis_data.dict()
+            else:
+                print(f"⚠️  RAG cache entry exists but data is None for meeting_id: {meeting_id}")
+                result["auto_analysis"] = None
+
+        except asyncio.TimeoutError:
+            print(f"⏰ Timeout waiting for RAG auto_analysis for meeting_id: {meeting_id}")
+            result["auto_analysis"] = None
+
+        # Cleanup cache entry
+        if meeting_id in rag_analysis_cache:
+            del rag_analysis_cache[meeting_id]
+            print(f"🧹 Cleaned up cache entry for meeting_id: {meeting_id}")
+
         return {"json_output": result}
+
     except Exception as e:
+        # Cleanup cache on error
+        if request.meeting_id in rag_analysis_cache:
+            del rag_analysis_cache[request.meeting_id]
         # Decorator otomatik olarak error'u track eder
         raise HTTPException(status_code=500, detail=str(e))
 

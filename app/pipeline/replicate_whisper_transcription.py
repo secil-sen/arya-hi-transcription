@@ -12,9 +12,9 @@ def run_replicate_whisper_transcription(
     enable_fallback: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Transcribe a WAV file using Replicate's Incredibly Fast Whisper model.
+    Transcribe a WAV file using Replicate's WhisperX model.
 
-    This function transcribes an entire WAV file (not segment-based like the original)
+    This function transcribes an entire WAV file with diarization and word-level timestamps
     and returns segments compatible with the existing pipeline format.
 
     Parameters
@@ -72,17 +72,18 @@ def run_replicate_whisper_transcription(
 
 def parse_replicate_response(transcription_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Parse Replicate transcription response into the expected segment format.
+    Parse Replicate WhisperX response into the expected segment format.
 
-    Expected Replicate format:
+    Expected WhisperX format (victor-upmeet/whisperx):
     {
-        "text": "Full transcript text",
+        "detected_language": "tr",
         "segments": [
             {
                 "start": 0.0,
-                "end": 2.5,
+                "end": 4.48,
                 "text": "Segment text",
-                "speaker": "SPEAKER_00"  # if diarization enabled
+                "speaker": "SPEAKER_00",  # With diarization enabled
+                "words": [...]             # With align_output enabled
             }
         ]
     }
@@ -94,16 +95,21 @@ def parse_replicate_response(transcription_result: Dict[str, Any]) -> List[Dict[
     # Get segments from Replicate response
     replicate_segments = transcription_result.get("segments", [])
 
+    # Log the detected language (WhisperX uses "detected_language" field)
+    detected_language = transcription_result.get("detected_language", transcription_result.get("language", "unknown"))
+    print(f"🌍 Detected language: {detected_language}")
+
     if not replicate_segments:
-        # If no segments, create one segment from full text
+        # If no segments, create one segment from full text (fallback)
         full_text = transcription_result.get("text", "").strip()
         if full_text:
             segments.append({
                 "start": 0.0,
                 "end": 10.0,  # Default duration
-                "speaker": "SPEAKER_00",
+                "speaker": "spk_0",
                 "text": full_text
             })
+            print("⚠️  No segments in response, created fallback segment")
         return segments
 
     # Process each segment
@@ -111,34 +117,59 @@ def parse_replicate_response(transcription_result: Dict[str, Any]) -> List[Dict[
         try:
             start_time = float(segment.get("start", 0.0))
             end_time = float(segment.get("end", start_time + 1.0))
-            text = str(segment.get("text", "")).strip()
 
-            # Handle speaker ID
-            speaker = segment.get("speaker", f"SPEAKER_{i:02d}")
+            # Try multiple possible field names for text
+            text = None
+            for field_name in ["text", "transcript", "content"]:
+                if field_name in segment:
+                    text = str(segment.get(field_name, "")).strip()
+                    if text:
+                        break
 
-            # Convert Replicate speaker format to our format
-            if speaker.startswith("SPEAKER_"):
-                # Convert SPEAKER_00, SPEAKER_01 to spk_0, spk_1
-                speaker_num = speaker.split("_")[-1]
+            # If still no text, use empty string
+            if text is None:
+                text = ""
+
+            # Handle speaker ID from whisper-diarization model
+            speaker = segment.get("speaker", f"SPEAKER_0")
+
+            # Convert Replicate speaker format to our format (spk_0, spk_1, etc.)
+            if speaker and speaker.startswith("SPEAKER_"):
+                # Convert SPEAKER_00, SPEAKER_01, SPEAKER_0, SPEAKER_1 to spk_0, spk_1
+                speaker_num = speaker.replace("SPEAKER_", "")
                 try:
+                    # Handle both "00" and "0" formats
                     speaker_id = int(speaker_num)
                     speaker = f"spk_{speaker_id}"
                 except (ValueError, IndexError):
-                    speaker = f"spk_{i % 2}"  # Fallback
+                    # Fallback if parsing fails
+                    speaker = f"spk_{i % 2}"
+                    print(f"⚠️  Warning: Could not parse speaker '{segment.get('speaker')}', using fallback: {speaker}")
+            elif not speaker or speaker == "":
+                # No speaker info, assign based on index
+                speaker = f"spk_{i % 2}"
 
-            if text:  # Only add segments with text
-                segments.append({
-                    "start": round(start_time, 2),
-                    "end": round(end_time, 2),
-                    "speaker": speaker,
-                    "text": text
-                })
+            # Add segment even if text is empty (for debugging)
+            segments.append({
+                "start": round(start_time, 2),
+                "end": round(end_time, 2),
+                "speaker": speaker,
+                "text": text
+            })
 
         except Exception as e:
             print(f"⚠️  Warning: Failed to parse segment {i}: {e}")
             continue
 
-    print(f"✅ Parsed {len(segments)} segments from Replicate response")
+    print(f"✅ Parsed {len(segments)} segments from Replicate WhisperX response")
+
+    # Log speaker distribution
+    speaker_counts = {}
+    for seg in segments:
+        spk = seg.get("speaker", "unknown")
+        speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+    print(f"📊 Speaker distribution: {speaker_counts}")
+
     return segments
 
 

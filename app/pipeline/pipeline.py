@@ -14,17 +14,18 @@ from app.utils.path_utils import (
 
 from typing import List, Optional
 
-# 🚀 MONITORING IMPORT - Pipeline'da detaylı metrics için
-from transcript_monitoring import transcript_monitor
+# 🚀 MONITORING IMPORT - DISABLED
+# from transcript_monitoring import transcript_monitor
 
 from app.pipeline.ffmpeg_utils import convert_mp4_to_wav, split_wav_into_chunks_v2
 from app.pipeline.diarization import diarize_chunks_with_global_ids_union
 from app.pipeline.transcription import run_whisper_transcription
 from app.pipeline.utils import save_as_json, filter_short_segments
-from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3, enrich_names_with_gemini
 from app.pipeline.config import DEFAULT_OUTPUT_ROOT, TERM_LIST
-from app.pipeline.rule_based_name_extraction import apply_name_extraction_to_segments
-from app.pipeline.embedding_extraction import extract_embeddings_async
+from app.pipeline.correct_and_infer import gemini_correct_and_infer_segments_async_v3, enrich_names_with_gemini
+# DISABLED IMPORTS - Not used anymore
+# from app.pipeline.rule_based_name_extraction import apply_name_extraction_to_segments
+# from app.pipeline.embedding_extraction import extract_embeddings_async
 from collections import Counter, defaultdict
 try:
     from app.pipeline.notification import notify_chunking, save_as_jsonl
@@ -207,28 +208,27 @@ def apply_speaker_name_mapping(segments):
     return updated_segments
 
 
-# 🚀 DECORATOR EKLENDİ - Pipeline'da detaylı monitoring!
-@transcript_monitor(
-    user_context=lambda *args, **kwargs: kwargs.get('user_id', 'anonymous'),
-    session_context=lambda *args, **kwargs: kwargs.get('meeting_id'),
-    track_audio_metadata=True,
-    custom_config={
-        "track_performance_metrics": True,
-        "track_quality_metrics": True,
-        "offline_mode": True  # İlk test için offline
-    }
-)
+# 🚀 MONITORING DECORATOR - DISABLED
+# @transcript_monitor(
+#     user_context=lambda *args, **kwargs: kwargs.get('user_id', 'anonymous'),
+#     session_context=lambda *args, **kwargs: kwargs.get('meeting_id'),
+#     track_audio_metadata=True,
+#     custom_config={
+#         "track_performance_metrics": True,
+#         "track_quality_metrics": True,
+#         "offline_mode": True
+#     }
+# )
 async def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTPUT_ROOT, user_id: str = "anonymous",
                                   attendees: Optional[List[str]] = None, meeting_id: Optional[str] = None) -> dict:
     """
-    Video transcript pipeline - şimdi otomatik monitoring ile!
+    Video transcript pipeline - Pure raw transcription (no monitoring, no processing)
 
-    Decorator otomatik olarak:
-    - Pipeline'ın her aşamasının süresini ölçer
-    - Audio file metadata'sını toplar
-    - Quality metrics hesaplar
-    - User ve session analytics yapar
-    - Background'da Vertex AI'ya gönderir
+    Pipeline stages:
+    1. MP4 to WAV conversion
+    2. Replicate Whisper-Diarization (raw output)
+    3. Filter short segments
+    4. Save to JSON/JSONL
     """
     session_id = uuid4().hex
     user_session_dir = get_user_session_path(output_root, user_id, session_id)
@@ -328,135 +328,121 @@ async def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTP
 
             print(f"Generated dynamic attendees: {attendees}")
 
-        # Step 5: Correction and infer with Gemini
-        attendee_id_map = {f"u_{attendee.lower()}": attendee for attendee in attendees}
+        # Step 5: Gemini Text Processing - CONDITIONAL
+        ENABLE_GEMINI_PROCESSING = os.getenv("ENABLE_GEMINI_PROCESSING", "false").lower() == "true"
 
-        debug_dir = get_debug_dir_path(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE",
-                                                                                "false").lower() == "true" else None
+        if ENABLE_GEMINI_PROCESSING:
+            print("🚀 Gemini text correction and speaker inference is ENABLED")
+            print("   Processing transcripts with Gemini for text correction...")
 
-        # 🚀 ASYNC FIX - Pipeline artık async, direkt await kullan
-        enriched_segments = await gemini_correct_and_infer_segments_async_v3(
-            segments=filtered_segments,
-            attendee_list=attendees,
-            term_list=TERM_LIST,
-            attendee_id_map=attendee_id_map,
-            enable_json_mode=True,
-            debug_dir=debug_dir
-        )
+            attendee_id_map = {f"u_{attendee.lower()}": attendee for attendee in attendees}
+            debug_dir = get_debug_dir_path(user_session_dir, "gemini_debug") if os.getenv("DEBUG_MODE",
+                                                                                    "false").lower() == "true" else None
 
-        print(f"Enriched segments count: {len(enriched_segments)}")
-        if enriched_segments:
-            print(f"First enriched segment: {enriched_segments[0]}")
-        else:
-            print("WARNING: No segments after Gemini processing!")
-
-        # Step 5: Apply rule-based name extraction (NER)
-        print("Applying rule-based name extraction (NER)...")
-        ner_start_time = __import__('time').time()
-
-        try:
-            # Only apply name extraction if we have segments and attendees
-            if enriched_segments and attendees:
-                # NER Configuration - Using bert-base model (much safer than xlm-roberta)
-                # Your selected model: "Davlan/bert-base-multilingual-cased-ner-hrl"
-                # Heavy model (avoid): "Davlan/xlm-roberta-base-ner-hrl"
-                ner_model = "Davlan/bert-base-multilingual-cased-ner-hrl"
-                print(f"🤖 NER MODEL ENABLED: {ner_model}")
-                print("   Using BERT-base model (safer than XLM-RoBERTa)")
-
-                enriched_segments = apply_name_extraction_to_segments(
-                    segments=enriched_segments,
-                    attendees=attendees,
-                    ner_model=ner_model,
-                    tau_ms=90000,  # 90 seconds temporal window
-                    threshold=0.4,  # Minimum confidence threshold
-                    spk_strong_thr=1.5,  # Speaker canonical assignment threshold
-                    spk_margin=0.6,  # Margin between top candidates
-                    spk_min_dur_ms=3000  # Minimum speaker duration (3 seconds)
-                )
-
-                # Count segments with extracted names
-                segments_with_names = sum(1 for seg in enriched_segments if seg.get("extracted_names"))
-                total_names = sum(len(seg.get("extracted_names", [])) for seg in enriched_segments)
-
-                ner_elapsed_time = __import__('time').time() - ner_start_time
-                print(f"✅ Name extraction (NER) completed in {ner_elapsed_time:.2f}s")
-                print(f"   - {segments_with_names}/{len(enriched_segments)} segments have extracted names")
-                print(f"   - Total names extracted: {total_names}")
-
-                if enriched_segments and enriched_segments[0].get("extracted_names"):
-                    print(f"   - Sample names (first segment): {enriched_segments[0].get('extracted_names', [])}")
-
-                # Debug: Show all extracted names for verification
-                print("   - All extracted names by segment:")
-                for i, seg in enumerate(enriched_segments[:5]):  # Show first 5 segments
-                    names = seg.get('extracted_names', [])
-                    if names:
-                        print(f"     Segment {i+1}: {names}")
-                    else:
-                        print(f"     Segment {i+1}: (no names)")
-                if len(enriched_segments) > 5:
-                    print(f"     ... and {len(enriched_segments) - 5} more segments")
-            else:
-                print("⚠️  Skipping name extraction: No segments or attendees provided")
-                # Add empty extracted_names field to all segments
-                for seg in enriched_segments:
-                    seg["extracted_names"] = []
-
-        except ImportError as e:
-            print(f"⚠️  Name extraction dependency missing: {e}")
-            print("   Installing rapidfuzz: pip install rapidfuzz")
-            # Add empty extracted_names field to all segments
-            for seg in enriched_segments:
-                seg["extracted_names"] = []
-        except Exception as e:
-            print(f"⚠️  Name extraction failed: {e}")
-            # Continue pipeline even if name extraction fails
-            for seg in enriched_segments:
-                seg["extracted_names"] = []
-
-        # Step 5.5: Correct extracted names with Gemini
-        print("Correcting extracted names with Gemini...")
-        try:
-            enriched_segments = await enrich_names_with_gemini(enriched_segments)
-        except Exception as e:
-            print(f"⚠️  Name correction with Gemini failed: {e}")
-            # Continue pipeline even if name correction fails
-            pass
-
-        # Step 5.6: Extract embeddings from audio segments
-        print("Extracting speaker embeddings from audio...")
-        embedding_start_time = __import__('time').time()
-
-        try:
-            from app.core.model_registry import models
-
-            # Extract embeddings using the WAV file
-            enriched_segments = await extract_embeddings_async(
-                segments=enriched_segments,
-                audio_path=wav_path,
-                inference_model=models.inference
+            enriched_segments = await gemini_correct_and_infer_segments_async_v3(
+                segments=filtered_segments,
+                attendee_list=attendees,
+                term_list=TERM_LIST,
+                attendee_id_map=attendee_id_map,
+                enable_json_mode=True,
+                debug_dir=debug_dir
             )
 
-            # Count segments with embeddings
-            segments_with_embeddings = sum(1 for seg in enriched_segments if seg.get("embedding") is not None)
-            embedding_elapsed_time = __import__('time').time() - embedding_start_time
+            print(f"Enriched segments count: {len(enriched_segments)}")
+            if enriched_segments:
+                print(f"First enriched segment: {enriched_segments[0]}")
+            else:
+                print("WARNING: No segments after Gemini processing!")
+        else:
+            print("⚠️  Gemini text correction is DISABLED")
+            print("   Using raw transcripts with text_corrected fallback...")
 
-            print(f"✅ Embedding extraction completed in {embedding_elapsed_time:.2f}s")
-            print(f"   - {segments_with_embeddings}/{len(enriched_segments)} segments have embeddings")
+            # Create enriched segments with raw text copied to text_corrected
+            enriched_segments = [
+                {
+                    **seg,
+                    "text_corrected": seg.get("text", ""),  # Copy raw text to text_corrected
+                    "inferred_speaker": seg.get("speaker", ""),  # Keep original speaker
+                    "source": "raw_segment_fallback",  # Mark as raw fallback
+                    "mentioned_attendees": [],  # Empty list
+                    "candidate_speakers": []  # Empty list
+                }
+                for seg in filtered_segments
+            ]
 
-            if segments_with_embeddings > 0:
-                sample_dim = enriched_segments[0].get("embedding_dim", "unknown")
-                print(f"   - Embedding dimension: {sample_dim}")
+            print(f"✅ Created {len(enriched_segments)} enriched segments from raw transcripts")
+            if enriched_segments:
+                print(f"First enriched segment (raw fallback): {enriched_segments[0]}")
 
-        except Exception as e:
-            print(f"⚠️  Embedding extraction failed: {e}")
-            print("   Continuing pipeline without embeddings...")
-            # Add None embeddings to all segments
-            for seg in enriched_segments:
-                if "embedding" not in seg:
-                    seg["embedding"] = None
-                    seg["embedding_error"] = str(e)
+        # Step 5: Apply rule-based name extraction (NER) - DISABLED
+        print("⚠️  Rule-based name extraction (NER) is DISABLED")
+        print("   Keeping original speaker labels (spk_0, spk_1, etc.)")
+
+        # Add empty extracted_names field to all segments
+        for seg in enriched_segments:
+            seg["extracted_names"] = []
+
+        # COMMENTED OUT - NER extraction disabled
+        # ner_start_time = __import__('time').time()
+        # try:
+        #     if enriched_segments and attendees:
+        #         ner_model = "Davlan/bert-base-multilingual-cased-ner-hrl"
+        #         enriched_segments = apply_name_extraction_to_segments(
+        #             segments=enriched_segments,
+        #             attendees=attendees,
+        #             ner_model=ner_model,
+        #             tau_ms=90000,
+        #             threshold=0.4,
+        #             spk_strong_thr=1.5,
+        #             spk_margin=0.6,
+        #             spk_min_dur_ms=3000
+        #         )
+        # except Exception as e:
+        #     print(f"⚠️  Name extraction failed: {e}")
+        #     for seg in enriched_segments:
+        #         seg["extracted_names"] = []
+
+        # Step 5.5: Correct extracted names with Gemini - DISABLED
+        print("⚠️  Gemini name correction is DISABLED")
+        print("   Skipping name enrichment with Gemini API")
+
+        # COMMENTED OUT - Gemini name correction disabled
+        # try:
+        #     enriched_segments = await enrich_names_with_gemini(enriched_segments)
+        # except Exception as e:
+        #     print(f"⚠️  Name correction with Gemini failed: {e}")
+        #     pass
+
+        # Step 5.6: Extract embeddings from audio segments (DISABLED)
+        print("⚠️  Embedding extraction is DISABLED - skipping...")
+        # Add None embeddings to all segments
+        for seg in enriched_segments:
+            if "embedding" not in seg:
+                seg["embedding"] = None
+                seg["embedding_disabled"] = True
+
+        # Original embedding extraction code (commented out):
+        # try:
+        #     from app.core.model_registry import models
+        #     enriched_segments = await extract_embeddings_async(
+        #         segments=enriched_segments,
+        #         audio_path=wav_path,
+        #         inference_model=models.inference
+        #     )
+        #     segments_with_embeddings = sum(1 for seg in enriched_segments if seg.get("embedding") is not None)
+        #     embedding_elapsed_time = __import__('time').time() - embedding_start_time
+        #     print(f"✅ Embedding extraction completed in {embedding_elapsed_time:.2f}s")
+        #     print(f"   - {segments_with_embeddings}/{len(enriched_segments)} segments have embeddings")
+        #     if segments_with_embeddings > 0:
+        #         sample_dim = enriched_segments[0].get("embedding_dim", "unknown")
+        #         print(f"   - Embedding dimension: {sample_dim}")
+        # except Exception as e:
+        #     print(f"⚠️  Embedding extraction failed: {e}")
+        #     print("   Continuing pipeline without embeddings...")
+        #     for seg in enriched_segments:
+        #         if "embedding" not in seg:
+        #             seg["embedding"] = None
+        #             seg["embedding_error"] = str(e)
 
         # Step 6: Save output as JSONL (if notification available)
         output_jsonl_path = os.path.join(user_session_dir, "transcript.jsonl")
@@ -490,9 +476,12 @@ async def run_transcript_pipeline(mp4_path: str, output_root: str = DEFAULT_OUTP
         elif not meeting_id:
             print("Warning: meeting_id not provided, skipping notification")
 
-        # Step 7: Apply extracted names to speaker IDs
-        print("Applying extracted names to speaker IDs...")
-        enriched_segments = apply_speaker_name_mapping(enriched_segments)
+        # Step 7: Apply extracted names to speaker IDs - DISABLED
+        print("⚠️  Speaker name mapping is DISABLED")
+        print("   Keeping original diarization speaker IDs (spk_0, spk_1, etc.)")
+
+        # COMMENTED OUT - Speaker name mapping disabled
+        # enriched_segments = apply_speaker_name_mapping(enriched_segments)
 
         # 8. Clean up (if not debug)
         if os.getenv("DEBUG_MODE", "false").lower() != "true":

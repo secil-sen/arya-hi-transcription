@@ -15,11 +15,12 @@ load_dotenv()
 
 
 class ReplicateTranscriptionService:
-    """Replicate-based transcription service using Incredibly Fast Whisper model."""
+    """Replicate-based transcription service using WhisperX model."""
 
     def __init__(self):
         self.client = None
-        self.model_version = "vaibhavs10/incredibly-fast-whisper:3ab86df6c8f54c11309d4d1f930ac292bad43ace52d10c80d87eb258b3c9f79c"
+        # Updated to victor-upmeet/whisperx model with pyannote diarization and word-level timestamps
+        self.model_version = "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb"
         self._initialized = False
 
     def _initialize_client(self):
@@ -93,13 +94,13 @@ class ReplicateTranscriptionService:
         enable_diarization: bool = True
     ) -> Dict[str, Any]:
         """
-        Transcribe audio using Replicate's Incredibly Fast Whisper model.
+        Transcribe audio using Replicate's Whisper Diarization model.
 
         Args:
             audio_file_path: Path to the audio file (WAV format recommended)
             language: Language code (default: "tr" for Turkish)
-            batch_size: Batch size for processing (default: 24 for optimal performance)
-            return_timestamps: Whether to return timestamps for segments
+            batch_size: Not used in new model (kept for compatibility)
+            return_timestamps: Not used in new model (kept for compatibility)
             enable_diarization: Whether to enable speaker diarization
 
         Returns:
@@ -110,46 +111,52 @@ class ReplicateTranscriptionService:
         if not os.path.exists(audio_file_path):
             raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
 
-        # Get HuggingFace token for diarization
+        # Get HuggingFace token from environment (required for WhisperX diarization)
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
-        if enable_diarization and not hf_token:
-            print("⚠️  Warning: HUGGINGFACE_TOKEN not found, disabling diarization")
-            enable_diarization = False
+        if not hf_token:
+            raise EnvironmentError(
+                "HUGGINGFACE_TOKEN not found in environment variables. "
+                "Required for WhisperX diarization. Please set it in your .env file."
+            )
 
         # Try to create S3 pre-signed URL first (fastest option)
         s3_url = self._create_s3_presigned_url(audio_file_path)
 
-        # Convert language code to full name
-        language_name = self._get_language_name(language)
-
-        # Prepare input parameters
+        # Prepare input parameters for WhisperX model
         input_params = {
-            "batch_size": batch_size,
-            "return_timestamps": return_timestamps,
-            "language": language_name
+            "language": language,  # ISO language code (e.g., "tr" for Turkish)
+            "diarization": True,  # Enable speaker diarization with pyannote
+            "align_output": True,  # Enable word-level timestamps
+            "huggingface_access_token": hf_token,  # Required for pyannote diarization
+            "batch_size": 64,  # Default batch size
+            "temperature": 0,  # Sampling temperature
+            "vad_onset": 0.5,  # Voice activity detection onset
+            "vad_offset": 0.363,  # Voice activity detection offset
+            "initial_prompt": "",  # Empty initial prompt
+            "language_detection_min_prob": 0,  # Language detection probability threshold
+            "language_detection_max_tries": 5,  # Max language detection attempts
+            "debug": False  # Disable debug output
+            # min_speakers: omitted (auto-detect)
+            # max_speakers: omitted (auto-detect)
         }
-
-        # Add diarization if enabled
-        if enable_diarization and hf_token:
-            input_params["hf_token"] = hf_token
-            print(f"🎯 Enabling speaker diarization with HuggingFace token")
 
         # Use S3 URL if available, otherwise open file directly
         if s3_url:
-            input_params["audio"] = s3_url
+            input_params["audio_file"] = s3_url
             print(f"📡 Using S3 URL for audio input: {os.path.basename(audio_file_path)}")
         else:
             # Fallback to file upload
             with open(audio_file_path, "rb") as audio_file:
-                input_params["audio"] = audio_file
+                input_params["audio_file"] = audio_file
                 print(f"📁 Using direct file upload: {os.path.basename(audio_file_path)}")
 
         try:
-            print(f"🚀 Starting Replicate transcription...")
-            print(f"   Model: {self.model_version}")
+            print(f"🚀 Starting Replicate WhisperX transcription...")
+            print(f"   Model: victor-upmeet/whisperx")
             print(f"   Language: {language}")
-            print(f"   Batch size: {batch_size}")
-            print(f"   Diarization: {'enabled' if enable_diarization else 'disabled'}")
+            print(f"   Diarization: {input_params['diarization']}")
+            print(f"   Align output (word-level): {input_params['align_output']}")
+            print(f"   Auto-detect speakers: True (min/max omitted)")
 
             start_time = time.time()
 
@@ -281,45 +288,51 @@ class ReplicateTranscriptionService:
         if not os.path.exists(audio_file_path):
             raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
 
-        # Get HuggingFace token for diarization
+        # Get HuggingFace token from environment (required for WhisperX diarization)
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
-        if enable_diarization and not hf_token:
-            print("⚠️  Warning: HUGGINGFACE_TOKEN not found, disabling diarization")
-            enable_diarization = False
+        if not hf_token:
+            raise EnvironmentError(
+                "HUGGINGFACE_TOKEN not found in environment variables. "
+                "Required for WhisperX diarization. Please set it in your .env file."
+            )
 
         # Try to create S3 pre-signed URL first (fastest option)
         s3_url = self._create_s3_presigned_url(audio_file_path)
 
-        # Convert language code to full name
-        language_name = self._get_language_name(language)
-
-        # Prepare input parameters
+        # Prepare input parameters for WhisperX model
         input_params = {
-            "batch_size": batch_size,
-            "return_timestamps": return_timestamps,
-            "language": language_name
+            "language": language,  # ISO language code (e.g., "tr" for Turkish)
+            "diarization": True,  # Enable speaker diarization with pyannote
+            "align_output": True,  # Enable word-level timestamps
+            "huggingface_access_token": hf_token,  # Required for pyannote diarization
+            "batch_size": 64,  # Default batch size
+            "temperature": 0,  # Sampling temperature
+            "vad_onset": 0.5,  # Voice activity detection onset
+            "vad_offset": 0.363,  # Voice activity detection offset
+            "initial_prompt": "",  # Empty initial prompt
+            "language_detection_min_prob": 0,  # Language detection probability threshold
+            "language_detection_max_tries": 5,  # Max language detection attempts
+            "debug": False  # Disable debug output
+            # min_speakers: omitted (auto-detect)
+            # max_speakers: omitted (auto-detect)
         }
-
-        # Add diarization if enabled
-        if enable_diarization and hf_token:
-            input_params["hf_token"] = hf_token
-            print(f"🎯 Enabling speaker diarization with HuggingFace token")
 
         # Use S3 URL if available, otherwise use file path directly
         if s3_url:
-            input_params["audio"] = s3_url
+            input_params["audio_file"] = s3_url
             print(f"📡 Using S3 URL for audio input: {os.path.basename(audio_file_path)}")
         else:
             # Use file path directly - Replicate will handle the file reading
-            input_params["audio"] = open(audio_file_path, "rb")
+            input_params["audio_file"] = open(audio_file_path, "rb")
             print(f"📁 Using direct file upload: {os.path.basename(audio_file_path)}")
 
         try:
-            print(f"🚀 Starting Replicate transcription (sync mode)...")
-            print(f"   Model: {self.model_version}")
+            print(f"🚀 Starting Replicate WhisperX transcription (sync mode)...")
+            print(f"   Model: victor-upmeet/whisperx")
             print(f"   Language: {language}")
-            print(f"   Batch size: {batch_size}")
-            print(f"   Diarization: {'enabled' if enable_diarization else 'disabled'}")
+            print(f"   Diarization: {input_params['diarization']}")
+            print(f"   Align output (word-level): {input_params['align_output']}")
+            print(f"   Auto-detect speakers: True (min/max omitted)")
 
             start_time = time.time()
 
@@ -329,9 +342,9 @@ class ReplicateTranscriptionService:
             elapsed_time = time.time() - start_time
 
             # Close file handle if we opened one
-            if not s3_url and "audio" in input_params:
+            if not s3_url and "audio_file" in input_params:
                 try:
-                    input_params["audio"].close()
+                    input_params["audio_file"].close()
                 except:
                     pass
 
